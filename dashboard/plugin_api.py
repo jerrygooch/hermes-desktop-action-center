@@ -56,16 +56,46 @@ store (``record_expired_request`` / load / prune / clear) verbatim, so records
 written by a gateway carrying the core change (or by any caller of the same
 API) are listed, redone and dismissed here; nothing in this plugin mutates
 gateway behavior at import time.
+
+STANDALONE PRODUCER (observed requests): on an unpatched gateway the plugin
+still records what IT observes, through the SUPPORTED, observer-only plugin
+hooks ``pre_approval_request`` / ``post_approval_response`` (``VALID_HOOKS`` in
+``hermes_cli.plugins``, fired by ``tools.approval_gateway_wait`` on every
+settlement with an authoritative outcome). Registration is lazy (first read),
+idempotent and ledger-owned — it never touches ``register_gateway_settle``
+(which REPLACES the single settle callback) and never mutates gateway
+behavior. The producer registers AS ITSELF: the manifest identity (name,
+source, dir) comes from the dashboard host's own plugin discovery — the same
+identity the host mounted this backend from, with the host's configured
+enable/consent gates (``plugins.disabled`` deny-list; a ``user`` source must
+be in ``plugins.enabled``) re-checked at registration and on every record, so
+a runtime disable stops capture immediately. ``source`` is never fabricated
+(least of all ``bundled``); when the host never mounted this backend the
+producer stays unregistered. The registration is best-effort: when the
+producer is unavailable nothing is recorded, and every read response carries
+an explicit coverage descriptor (``coverage.expired_requests``) naming the
+state — ``active`` / ``unavailable`` / ``unavailable_for_profile`` /
+``disabled`` — with the reason.
+
+KNOWN COVERAGE LIMIT (do not narrow): the producer sees only the settlements
+its own process observes through those hooks, and records only sessions with a
+human-facing durable row in the launch profile. A pending approval this
+process never settles (CLI-gate prompts, smart verdicts, prompts answered
+through a different surface before the hook fires) leaves no record — the
+panel therefore shows an honest, PARTIAL history, never a claim that an
+unanswered unknown expired.
 """
 
 from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import inspect
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any
 
@@ -125,6 +155,26 @@ _DIRECT_STATE_ACTIONS = frozenset({
 # the approval payload's own ``choices``).
 _ALLOWED_CHOICES = frozenset({"once", "session", "always", "deny"})
 
+# ── observed requests: the standalone expiry producer ─────────────────────────
+# The core's expired-request WRITER is the gateway's approval-settle hook
+# (``server._emit_approval_request``), which a plugin must not patch — and
+# ``register_gateway_settle`` REPLACES the single settle callback, so arming it
+# here would steal the TUI's request withdrawal. The supported production seam
+# is the observer-only plugin hook ``post_approval_response`` (a ``VALID_HOOK``
+# in ``hermes_cli.plugins``), fired by ``tools.approval_gateway_wait`` on EVERY
+# settlement path with an authoritative outcome: an answered choice, or the
+# fail-closed non-answers ``timeout`` / ``notify_failed`` / ``cancelled`` —
+# never an inference from a request disappearing from the queue.
+#
+# HONEST COVERAGE (unchanged from the capability-gate era): this producer sees
+# ONLY the approvals its own process observes through that hook. The CLI gate
+# and the smart-verdict path do not carry ``request_id``/``session_key`` in
+# their hook kwargs, and every unknown session is refused below, so history
+# stays complete ONLY for gateway approvals the plugin's gateway resolves. A
+# pending approval this process never settles still leaves no record — the
+# panel must never claim an unanswered unknown expired.
+_OBSERVED_NON_ANSWER_CHOICES = frozenset({"timeout", "notify_failed", "cancelled"})
+
 # Core JSON-RPC error code → HTTP status (detail keeps the core's message).
 _STATUS_BY_CODE = {
     4001: 404,
@@ -152,6 +202,27 @@ def _server():
     from tui_gateway import server
 
     return server
+
+
+def _ensure_producer_for_reads() -> None:
+    """First read routes register the producer if the plugin system is live.
+
+    A dashboard-only backend imports this module long before any plugin
+    discovery runs, so import-time registration would only fail; the first
+    read happens after the web server's own plugin mounting, when discovery is
+    possible. Registration is idempotent (False → stays unregistered), never
+    raises into a read, and re-attempts on the NEXT read when it failed —
+    no thread, no polling.
+    """
+    try:
+        producer = _observed_request_producer
+        if producer is not None:
+            allowed, _ = _producer_gate(producer.manifest)
+            if not allowed or not _producer_still_registered(producer):
+                unregister_observed_request_producer()
+        register_observed_request_producer()
+    except Exception as exc:  # Observability must never fail a read.
+        _set_producer_reason(f"registration failed: {_safe_error_message(exc)}")
 
 
 def _deny_sources() -> frozenset:
@@ -775,6 +846,514 @@ def clear_expired_request(db, session_key: str, request_id: str) -> bool:
     return True
 
 
+# ── observed requests: the standalone producer (registration + callback) ──────
+# The producer registers AS ITSELF: its manifest identity comes from the
+# dashboard host's own plugin discovery (the same (name, source, dir) the host
+# mounted this backend from), and the host's configured enable/consent gates
+# (``plugins.disabled`` deny-list; a ``user`` source must be in
+# ``plugins.enabled``) are re-checked at registration and at EVERY record, so a
+# runtime disable stops capture immediately (per-record host gate) and the next
+# read tears the registration down through the ledger. When the identity cannot
+# be resolved honestly (the host never mounted this backend), the producer
+# stays unregistered — ``source`` is never fabricated, least of all "bundled".
+_PLUGIN_NAME = "action-center"
+_MAX_PROFILE_PROBES = 16
+
+
+class _ObservedRequestProducer:
+    """Registration state for the ``post_approval_response`` observer.
+
+    ``server`` is captured at registration: the gateway server module whose
+    SessionDB door this producer records through (and whose ``_profile_db``
+    tests patch). ``registered`` guards idempotent registration — the hook is
+    dispatched to every registered callback, so a double register would record
+    each settlement twice. ``manifest`` is the producer's OWN identity as the
+    host mounted it; ``post_handle`` / ``pre_handle`` are the ledger-backed
+    registrations this instance owns (disposed exactly once, by unregister or
+    by the partial-failure containment in :func:`register_observed_request_producer`).
+    """
+
+    __slots__ = ("server", "registered", "manifest", "post_handle", "pre_handle")
+
+    def __init__(self, server, manifest):
+        self.server = server
+        self.manifest = manifest
+        self.registered = True
+        self.post_handle = None
+        self.pre_handle = None
+
+
+_observed_request_producer: _ObservedRequestProducer | None = None
+_observed_request_producer_lock = threading.RLock()
+
+def _serialized_producer(fn):
+    from functools import wraps
+    @wraps(fn)
+    def guarded(*args, **kwargs):
+        with _observed_request_producer_lock:
+            return fn(*args, **kwargs)
+    return guarded
+# Why the producer is not live right now (the coverage descriptor's reason).
+_observed_request_producer_reason: str | None = None
+
+
+def _set_producer_reason(reason: str | None) -> None:
+    global _observed_request_producer_reason
+    with _observed_request_producer_lock:
+        _observed_request_producer_reason = reason
+
+
+def _dashboard_discovery() -> tuple[list | None, str | None]:
+    """The dashboard host's own plugin list — what the host actually mounted."""
+    try:
+        from hermes_cli.web_server_dashboard import _discover_dashboard_plugins as discover
+    except Exception as exc:  # noqa: BLE001 - discovery is optional (bare imports)
+        return None, f"dashboard discovery unavailable: {_safe_error_message(exc)}"
+    try:
+        return discover(), None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"dashboard discovery failed: {_safe_error_message(exc)}"
+
+
+def _resolve_producer_manifest() -> tuple[Any | None, str | None]:
+    """This backend's own manifest as the dashboard host mounted it.
+
+    The identity (name, key, source, path, version) comes from the host's own
+    discovery list, matched to THIS module's directory — never fabricated.
+    Returns ``(manifest, None)`` or ``(None, reason)``; ``project``/unknown
+    sources are refused (the host itself never auto-imports their Python).
+    """
+    entries, reason = _dashboard_discovery()
+    if entries is None:
+        return None, reason
+    here = os.path.dirname(os.path.abspath(__file__))
+    for entry in entries or []:
+        if not isinstance(entry, dict) or str(entry.get("name") or "") != _PLUGIN_NAME:
+            continue
+        source = str(entry.get("source") or "")
+        if source not in ("user", "bundled"):
+            continue  # project/unknown sources never auto-run backend code
+        dashboard_dir = str(entry.get("_dir") or "")
+        if not dashboard_dir or os.path.normcase(os.path.realpath(dashboard_dir)) != os.path.normcase(os.path.realpath(here)):
+            continue
+        plugin_dir = (os.path.dirname(dashboard_dir)
+                      if os.path.basename(dashboard_dir) == "dashboard" else dashboard_dir)
+        try:
+            from hermes_cli.plugins_manifest import PluginManifest
+        except Exception as exc:  # noqa: BLE001
+            return None, f"plugin manifest type unavailable: {_safe_error_message(exc)}"
+        return PluginManifest(
+            name=_PLUGIN_NAME,
+            version=str(entry.get("version") or "0.1.0"),
+            description=str(entry.get("description") or "Action Center"),
+            source=source, path=plugin_dir, key=_PLUGIN_NAME,
+        ), None
+    return None, "not a mounted dashboard plugin"
+
+
+def _producer_gate(manifest) -> tuple[bool, str | None]:
+    """The host's own enable/consent gates, re-checked against the LIVE config.
+
+    Mirrors ``hermes_cli.web_server_dashboard._plugin_api_mount_skip_reason`` —
+    the gate that must pass before this backend's Python ever runs — so the
+    producer's lifecycle matches the host's: ``plugins.disabled`` is a
+    deny-list that wins over everything; a ``user``-source plugin must be in
+    the ``plugins.enabled`` allow-list (missing allow-list = nothing enabled
+    yet); ``bundled`` respects an explicit disable; ``project`` never runs.
+    Fail closed on any unreadable config.
+    """
+    name = (getattr(manifest, "name", "") or "").strip()
+    key = (getattr(manifest, "key", "") or "").strip()
+    source = (getattr(manifest, "source", "") or "").strip().lower()
+    names = {n for n in (name, key) if n}
+    if not names:
+        return False, "unresolvable plugin identity"
+    if source == "project":
+        return False, "project plugins may not run backend code (host policy)"
+    try:
+        from hermes_cli.plugins_discovery import _get_disabled_plugins
+
+        disabled = _get_disabled_plugins() or set()
+    except Exception as exc:  # noqa: BLE001 - fail closed on an unreadable gate
+        return False, f"plugin config unreadable: {_safe_error_message(exc)}"
+    if names & disabled:
+        return False, "disabled via plugins.disabled"
+    if source == "bundled":
+        return True, None
+    if source == "user":
+        try:
+            from hermes_cli.plugins_discovery import _get_enabled_plugins
+
+            enabled = _get_enabled_plugins()
+        except Exception as exc:  # noqa: BLE001
+            return False, f"plugin config unreadable: {_safe_error_message(exc)}"
+        if not enabled or not (names & enabled):
+            return False, "not in plugins.enabled"
+        return True, None
+    return False, f"unsupported plugin source: {source or '(none)'}"
+
+
+@_serialized_producer
+def register_observed_request_producer(server=None, *, manifest=None) -> bool:
+    """Record unanswered gateway approvals from the SUPPORTED hook seam.
+
+    Resolves the producer's own manifest honestly (dashboard host discovery, or
+    an explicitly injected one for tests), applies the host's configured
+    enable/consent gates, then registers ``pre_approval_request`` /
+    ``post_approval_response`` through the plugin manager's ledger-backed
+    ``register_hook`` (the same mapping ``invoke_hook`` dispatches) — which
+    ``tools.approval_gateway_wait`` fires on every settlement with an
+    authoritative outcome. The server handle is resolved BEFORE any hook is
+    registered, and any failure after a partial registration disposes what
+    landed — a callback can never leak unowned. Returns True when the producer
+    is live; False (with the reason recorded for the coverage descriptor) when
+    the identity cannot be resolved, the gates refuse, or the plugin system is
+    unavailable: with no producer the store stays read-compatible and nothing
+    is recorded.
+    """
+    global _observed_request_producer, _observed_request_producer_reason
+    with _observed_request_producer_lock:
+        if _observed_request_producer is not None:
+            return False  # already registered; never double-record a settlement
+    resolved = manifest
+    if resolved is None:
+        resolved, resolve_reason = _resolve_producer_manifest()
+        if resolved is None:
+            _set_producer_reason(resolve_reason)
+            return False
+    gate_ok, gate_reason = _producer_gate(resolved)
+    if not gate_ok:
+        _set_producer_reason(gate_reason)
+        return False
+    producer = None
+    try:
+        from hermes_cli import plugins as _plugins
+        from hermes_cli.plugins import PluginContext
+
+        # Resolve the server handle FIRST: a failure here must not leave half
+        # a registration behind.
+        srv = server if server is not None else _server()
+        manager = _plugins.get_plugin_manager()
+        producer = _ObservedRequestProducer(srv, resolved)
+        # The same ledger-backed registration plugins get: the callback
+        # lands in manager._hooks[hook_name] and its removal is owned by
+        # the ledger (never a bare list append we could leak on unload).
+        ctx = PluginContext(resolved, manager)
+        producer.post_handle = ctx.register_hook("post_approval_response", _on_post_approval_response)
+        producer.pre_handle = ctx.register_hook("pre_approval_request", _observe_pre_approval_request)
+    except Exception as exc:  # noqa: BLE001 - an unavailable plugin system records nothing
+        # Partial-failure containment: dispose whatever landed BEFORE any
+        # producer state exists, so no callback can leak unowned.
+        if producer is not None:
+            for handle in (producer.post_handle, producer.pre_handle):
+                if handle is not None:
+                    try:
+                        handle.dispose()
+                    except Exception:  # noqa: BLE001
+                        pass
+        _set_producer_reason(f"registration failed: {_safe_error_message(exc)}")
+        log.debug("observed-request producer unavailable: %s", _safe_error_message(exc))
+        return False
+    with _observed_request_producer_lock:
+        _observed_request_producer = producer
+        _observed_request_producer_reason = None
+    return True
+
+
+def _producer_still_registered(producer) -> bool:
+    """True when the live plugin manager still dispatches to this producer.
+
+    The host's force re-discovery unloads every plugin registration; a producer
+    whose ledger entry was reaped must stop claiming coverage.
+    """
+    try:
+        from hermes_cli import plugins as _plugins
+
+        hooks = getattr(_plugins.get_plugin_manager(), "_hooks", None) or {}
+        return _on_post_approval_response in (hooks.get("post_approval_response") or [])
+    except Exception:  # Unverifiable is not successful coverage.
+        return False
+
+
+@_serialized_producer
+def unregister_observed_request_producer() -> None:
+    """Dispose the producer's hook registrations (the ledger's own inverse)."""
+    global _observed_request_producer, _observed_request_producer_reason
+    with _observed_request_producer_lock:
+        producer = _observed_request_producer
+        if producer is not None:
+            for handle in (producer.post_handle, producer.pre_handle):
+                if handle is not None:
+                    try:
+                        handle.dispose()
+                    except Exception:  # noqa: BLE001
+                        pass
+            producer.post_handle = None
+            producer.pre_handle = None
+            producer.registered = False
+        _observed_request_producer = None
+        _observed_request_producer_reason = "unregistered"
+        _observed_pending_ids.clear()
+
+
+def _on_post_approval_response(*args, **kwargs) -> None:
+    """The hook callback: record one settled approval when it ended unanswered.
+
+    Accepts either ``(**kwargs)`` (the core's ``**kwargs`` dispatch) or a
+    single positional payload mapping. Never raises: this runs on the approval
+    hot path inside ``_fire_approval_hook``, and observability must not break
+    the gate.
+    """
+    if len(args) == 1 and isinstance(args[0], dict) and not kwargs:
+        kwargs = args[0]
+    try:
+        _record_from_hook_kwargs(kwargs)
+    except Exception as exc:  # noqa: BLE001 - observability must never break approval
+        _set_producer_reason(f"capture failed: {_safe_error_message(exc)}")
+        log.debug("observed-request record failed: %s", _safe_error_message(exc))
+
+
+def _record_from_hook_kwargs(kwargs: dict) -> None:
+    """One hook payload → one durable record, behind every trust gate.
+
+    Order: a settlement the operator actually made (once/session/always/deny,
+    with no ``cancelled`` cause) is ignored — the prompt was answered. Only the
+    fail-closed non-answers are recorded: the ``timeout`` / ``notify_failed``
+    choice tokens, and ANY settlement carrying a ``cancelled`` cause (the core
+    passes ``cancelled`` when the wait ended with nobody answering — turn
+    interrupted, session torn down — even when the agent's own decision token
+    is ``deny`` or ``timeout``). The session must be a human-facing durable
+    session in the producer's profile — an unknown or deny-listed key is never
+    recorded, and a failed row probe records nothing (fail closed, never a
+    partial write on a bad read).
+
+    The producer's configured lifecycle gates are re-checked per record
+    (:func:`_producer_gate` against the LIVE config): a runtime disable stops
+    capture immediately, without waiting for a re-registration.
+
+    ``request_id`` correlation: the ``post_approval_response`` kwargs carry no
+    id, but the ``pre_approval_request`` hook fires WHILE the queue entry is
+    registered (``tools.approval_gateway_wait`` enqueues, then fires pre with
+    the same ``session_key``/``command``), so the producer keys the pending
+    entry's ``request_id`` at pre time and consumes it at post time. A
+    settlement with no observed pre (CLI gate, smart verdict — neither carries
+    a queue entry) falls back to a deterministic digest id; the record still
+    truthfully says what was asked and that it ended unanswered.
+    """
+    if kwargs.get("coalesced"):
+        return  # Followers are not another prompt lifecycle.
+    choice = str(kwargs.get("choice") or "")
+    cancelled = bool(kwargs.get("cancelled"))
+    session_key = str(kwargs.get("session_key") or "").strip()
+    payload = _observed_payload(kwargs, session_key)  # Consume correlation on ALL settlements.
+    if not cancelled and choice not in _OBSERVED_NON_ANSWER_CHOICES:
+        return
+    if not session_key:
+        return
+    producer = _observed_request_producer
+    if producer is None or not producer.registered:
+        return
+    # Host gate, live: a plugin disabled (or not consent-enabled) after
+    # registration stops recording at once — never a zombie producer.
+    gate_ok, _reason = _producer_gate(producer.manifest)
+    if not gate_ok:
+        return
+    outcome = "session_closed" if (cancelled or choice == "cancelled") else _observed_outcome(choice)
+    server = producer.server or _server()
+    try:
+        with server._profile_db({"profile": None}) as db:
+            if db is None:
+                return
+            try:
+                row = db.get_session(session_key)
+            except Exception:  # noqa: BLE001 - a bad read never widens the gate
+                return
+            if row is None or _denied_source(row):
+                return
+            if not record_expired_request(db, session_key, payload, outcome):
+                _set_producer_reason("capture persistence failed; history may be incomplete")
+    except Exception as exc:  # noqa: BLE001 - never break the approval flow
+        _set_producer_reason(f"capture failed: {_safe_error_message(exc)}")
+        log.debug("observed-request record failed: %s", _safe_error_message(exc))
+
+
+def _observed_payload(kwargs: dict, session_key: str) -> dict:
+    """The bounded, redacted payload persisted for one observed settlement.
+
+    Every settlement path is treated as the CLI gate's: the hook may fire with
+    an unredacted command (the command gate passes its raw display target), so
+    the copy is REDACTED HERE before anything is persisted — the same
+    ``redact_sensitive_text(force=True)`` egress rule the transcript excerpt
+    applies. Bounded by the same limits ``record_expired_request`` enforces.
+    """
+    command = _redact_context_text(str(kwargs.get("command") or ""))
+    description = _redact_context_text(str(kwargs.get("description") or ""))
+    request_id = _observed_request_id(kwargs, session_key, command)
+    return {
+        "request_id": request_id,
+        "command": command,
+        "description": description,
+        "pattern_keys": [str(k) for k in (kwargs.get("pattern_keys") or [])][:8],
+    }
+
+
+# The pending request ids this process has observed but not yet settled, keyed
+# by (session_key, redacted command). Bounded: at most one entry per distinct
+# (session, command) pair, evicted FIFO once over the cap — an approval wait is
+# at most one entry, so the cap is never reached in practice.
+_observed_pending_ids: dict[tuple[str, str], str] = {}
+_OBSERVED_PENDING_CAP = 128
+
+
+def _observed_request_id(kwargs: dict, session_key: str, command: str) -> str:
+    """The id for one observed settlement: the ``request_id`` captured at
+    ``pre_approval_request`` when this exact (session, command) is pending,
+    else a deterministic digest id (never a fabricated queue id)."""
+    explicit = str(kwargs.get("request_id") or "").strip()
+    key = (session_key, command)
+    with _observed_request_producer_lock:
+        pending = _observed_pending_ids.pop(key, None)
+    if explicit or pending:
+        return explicit or pending
+    return _observed_fallback_id(command)
+
+
+def _observe_pre_approval_request(*args, **kwargs) -> None:
+    """Capture the pending approval's ``request_id`` at pre time.
+
+    The queue entry is IN ``_gateway_queues`` (with its ``request_id``) when
+    the gateway fires this hook; the post callback consumes the entry one
+    time. When the kwargs carry no ``request_id`` (the gateway flow's payload
+    has none), the id is read from the queue's OWN replay-safe reader
+    (``list_gateway_approvals`` — the same public read the details route uses)
+    for this exact (session, redacted command). Unknown sessions are still
+    refused at post time, so a captured id for a session that never resolves
+    to a human-facing row is dropped there.
+
+    Dedupe: the gateway re-fires pre for an already-pending identical approval
+    (coalesced followers, ``pre_approval_request ... coalesced=True``) — one
+    queue entry is one map entry, so a duplicate pre never overwrites a
+    captured id with the next entry's id. When the kwargs DO carry a
+    ``request_id`` (real dispatch payloads and tests do), it wins over a
+    queue-read guess for the same (session, command).
+    """
+    if len(args) == 1 and isinstance(args[0], dict) and not kwargs:
+        kwargs = args[0]
+    session_key = str(kwargs.get("session_key") or "").strip()
+    if not session_key:
+        return
+    producer = _observed_request_producer
+    if producer is None or not producer.registered:
+        return
+    gate_ok, _reason = _producer_gate(producer.manifest)
+    if not gate_ok:
+        return
+    request_id = str(kwargs.get("request_id") or "").strip()
+    command = _redact_context_text(str(kwargs.get("command") or ""))
+    if not request_id and command:
+        try:
+            from tools import approval as _approval
+
+            for snapshot in _approval.list_gateway_approvals(session_key):
+                if str(snapshot.get("command") or "") == command and snapshot.get("request_id"):
+                    request_id = str(snapshot["request_id"])
+                    break  # oldest first: the entry a FIFO resolution settles
+        except Exception:  # noqa: BLE001 - correlation is best-effort
+            request_id = ""
+    if not request_id:
+        return
+    with _observed_request_producer_lock:
+        if len(_observed_pending_ids) >= _OBSERVED_PENDING_CAP:
+            # FIFO eviction: drop the oldest captured pending id.
+            for stale in list(_observed_pending_ids)[:len(_observed_pending_ids) - _OBSERVED_PENDING_CAP + 1]:
+                _observed_pending_ids.pop(stale, None)
+        _observed_pending_ids.setdefault((session_key, command), request_id)
+
+
+def _producer_coverage(profile: str | None) -> dict | None:
+    """The producer's coverage descriptor for one profile — or ``None`` when the
+    producer cannot observe THIS profile at all.
+
+    Live states surfaced explicitly (never an empty history masquerading as a
+    full one): the producer's own registration identity as the host mounted it
+    (``source: user|bundled`` — never an impersonated identity), the host's
+    live gate verdict, unavailable (with the reason), unavailable-for-profile
+    (a working producer only ever observes its own profile: named-profile
+    sessions are covered through their own profile's dashboard), or disabled
+    after registration (the gate flipped while live).
+    """
+    producer = _observed_request_producer
+    name = (profile or "").strip() or None
+    if producer is None or not producer.registered:
+        reason = _observed_request_producer_reason or "not registered"
+        return {"status": "unavailable", "observed": False, "reason": reason}
+    if _observed_request_producer_reason:
+        return {"status": "degraded", "observed": False, "reason": _observed_request_producer_reason}
+    manifest = producer.manifest
+    source = str(getattr(manifest, "source", "") or "")
+    if not _producer_still_registered(producer):
+        return {"status": "unavailable", "observed": False,
+                "reason": "producer registration no longer live in the plugin manager"}
+    gate_ok, gate_reason = _producer_gate(manifest)
+    if not gate_ok:
+        return {"status": "disabled", "observed": False,
+                "reason": gate_reason or "producer disabled"}
+    launch_home = None
+    try:
+        launch_home = _inbox_home_key(_server()._hermes_home)
+    except Exception:  # noqa: BLE001
+        launch_home = None
+    if name is not None and launch_home is not None:
+        try:
+            profile_home = _server()._profile_home(name)
+            if profile_home is not None and _inbox_home_key(profile_home) != launch_home:
+                return {"status": "unavailable_for_profile", "observed": False,
+                        "source": source,
+                        "reason": f"producer observes only the launch profile; '{name}' is served by its own process"}
+        except Exception:  # noqa: BLE001
+            pass
+    return {
+        "status": "active", "observed": True, "source": source,
+        "history_scope": "observed settlements only",
+        "profiles": ["launch"], "partial": True,
+        "note": "history covers approvals this gateway process settled through its approval hooks",
+    }
+
+
+def _observed_producer_reason_for_read() -> str | None:
+    """Best-effort reason for a read when no producer is live."""
+    reason = _observed_request_producer_reason
+    if reason:
+        return reason
+    _m, fresh = _resolve_producer_manifest()
+    return fresh
+
+
+def _observed_fallback_id(command: str) -> str:
+    """A stable, non-queue id for a settlement whose queue entry cannot be
+    correlated: ``observed-<sha256(command)[:16]>``. Collisions across
+    repeated identical commands overwrite the older record (Dismiss/Redo keys
+    are per-request-id) — an honest, bounded window, not a queue identity."""
+    digest = hashlib.sha256(f"{command}".encode("utf-8")).hexdigest()[:16]
+    return f"observed-{digest}"
+
+
+def _observed_outcome(choice: str) -> str:
+    """The hook's ``choice`` token → the store's outcome label.
+
+    ``cancelled`` fires both when the wait was interrupted and when the queue
+    entry was withdrawn with no answer (session closed, turn ended): both are
+    "ended without the operator ever getting to decide", so both persist as
+    ``session_closed`` — the same label the core's settle hook uses for
+    ``request.cancel`` withdrawals. ``timeout`` and ``notify_failed`` carry
+    through verbatim. (Callers fold a ``cancelled`` CAUSE into
+    ``session_closed`` before calling this.)
+    """
+    if choice == "cancelled":
+        return "session_closed"
+    return choice
+
+
 # ── request-detail build blocks (ported verbatim) ─────────────────────────────
 def _build_approval_payload(data: dict) -> dict:
     """Redacted approval payload with computed choices, matching the core."""
@@ -1133,6 +1712,7 @@ def action_center_summary(profile: str = "", limit: int = _DEFAULT_LIMIT) -> dic
     """
     server = _server()
     name = (profile or "").strip() or None
+    _ensure_producer_for_reads()
     with _profile_scope(name) as profile_home:
         try:
             cap = max(1, min(int(limit), _MAX_LIMIT))
@@ -1248,6 +1828,15 @@ def action_center_summary(profile: str = "", limit: int = _DEFAULT_LIMIT) -> dic
         # truncation — _listing_rows filters at Python level before this comparison.)
         raw_truncated = len(rows) > cap
         errors.extend(clarify_errors)
+        # The observed-requests producer's state is surfaced explicitly, never an
+        # empty history masquerading as a complete one. Unavailable = a named
+        # coverage error (red badge); a live producer only ever observes THIS
+        # process's settlements — history stays PARTIAL by construction.
+        producer_state = observed_requests_coverage(name)
+        if not producer_state.get("observed"):
+            status = str(producer_state.get("status") or "unavailable")
+            reason = str(producer_state.get("reason") or "producer unavailable")
+            errors.append(f"observed requests {status}: {reason}")
         coverage = {
             "profile": name or _profile_display_name(name),
             "connection_scope": "active connection and profile only",
@@ -1255,6 +1844,7 @@ def action_center_summary(profile: str = "", limit: int = _DEFAULT_LIMIT) -> dic
             "partial": raw_truncated,
             "approval_scope": "live gateway approval queue",
             "clarify_scope": "live open sessions only",
+            "expired_requests": producer_state,
             "errors": errors[:20],
         }
         return {
@@ -1282,6 +1872,7 @@ def action_center_details(session_key: str = "", profile: str = "") -> dict:
     if not key:
         raise _http_error(4002, "session_key is required")
     name = (profile or "").strip() or None
+    _ensure_producer_for_reads()
     with _profile_scope(name) as profile_home:
         # Durable identity is sessions.id; never trust only a runtime record's source.
         with server._profile_db({"profile": name}) as db:
@@ -1352,6 +1943,14 @@ def action_center_details(session_key: str = "", profile: str = "") -> dict:
         else:
             context_anchor = f"unavailable: {context.get('reason') or 'no context'}"
 
+        # The expired-request history is described over what the producer OBSERVED —
+        # never presented as the session's full request history.
+        producer_state = observed_requests_coverage(name)
+        if not producer_state.get("observed"):
+            status = str(producer_state.get("status") or "unavailable")
+            reason = str(producer_state.get("reason") or "producer unavailable")
+            all_errors.append(f"observed requests {status}: {reason}")
+
         coverage = {
             "profile": name or _profile_display_name(name),
             "session_key": key,
@@ -1359,6 +1958,7 @@ def action_center_details(session_key: str = "", profile: str = "") -> dict:
             "approval_count": len(all_approvals),
             "clarification_count": len(all_clarifications),
             "context_anchor": context_anchor,
+            "expired_requests": producer_state,
             "errors": all_errors[:20],
         }
         return {
@@ -1610,3 +2210,16 @@ def action_center_dismiss(body: DismissBody) -> dict:
     if not dismissed:
         raise _http_error(4001, "expired request not found")
     return {"dismissed": True}
+
+
+def observed_requests_coverage(profile: str | None = None) -> dict:
+    """Honest coverage descriptor for the observed-requests producer.
+
+    Never a fabricated all-clear: ``status`` is one of
+    ``active`` (records may exist; they are PARTIAL — only this process's
+    observed settlements), ``unavailable`` (no producer; ``reason`` says why),
+    ``unavailable_for_profile`` (a live producer cannot observe a named
+    foreign profile), or ``disabled`` (the plugin was disabled after
+    registration; capture stopped). Attached to every read response.
+    """
+    return _producer_coverage(profile)

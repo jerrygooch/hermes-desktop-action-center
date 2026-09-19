@@ -1,54 +1,70 @@
 # Action Center
 
-One panel for everything your agent sessions need from you: pending approvals, questions with lettered choices, expired requests that stick around with a Redo, and goal/loop/heartbeat controls with pause and resume. Answer and steer without opening the session.
+Answer approvals and questions, inspect recent context, and pause or resume automation without opening each session. Action Center is an opt-in Hermes Desktop plugin with a single-file UI and a gateway-side Python router. No core patches or build step are required.
 
-This is a **Hermes Desktop plugin**. It needs no patching of the app: the UI half is a single file the desktop loads at runtime, and the backend half is a small FastAPI router that rides the gateway's plugin namespace.
+## Features
 
-![The Action Center: session detail with approvals and automation controls, a lettered question card, and live search counts](assets/action-center.png)
+- Approve once, approve for the session, always allow, or deny. Only choices offered by the request are shown and accepted.
+- Answer single-choice, multi-select, free-text, and batch questions. Batch answers stay local until submitted.
+- Read a bounded, redacted excerpt of recent messages, with a link to the full chat.
+- Search session titles, keys and paths across sections, with live counts.
+- Pause or resume goals, loops and heartbeats, including stored sessions with no open runtime.
+- Review persisted expired approvals. Dismiss removes a record; Redo asks the running session to try again. Redo does not grant approval or execute a saved shell command directly.
+- Use a compact layout in narrow panes. Below the usable minimum, the panel shows a width notice and an Expand control instead of squeezed session cards.
 
-## What you can do from the panel
+## Install a local release
 
-- **Answer approvals in place.** Each pending request lists its command and description. Approve once, approve for the session, always allow (where the request offers those), or deny. Buttons disable while a response is in flight; failures say so.
-- **Answer questions without leaving.** Options letter A, B, C with the type-your-own row lettered right after the last choice. Multi-select questions send a JSON array; a batch stages an answer per question and resolves in one submit.
-- **See why you're being asked.** The detail carries a bounded, redacted excerpt of the session's recent messages, with "Open full chat" when you want the whole conversation.
-- **Search every session at once.** A query searches all sections; the rail shows live match counts, dims sections with none, and a click narrows the list.
-- **Pause or resume automation.** Goal, loop and heartbeat sections state what each automation runs and how far along it is (turns, criteria, cadence, stop conditions, fire counts). Pause and resume work for stored sessions too: they are persisted-state writes, so the panel acts on the saved session even with no runtime behind it.
-- **Keep the tail of a timeout.** A request that times out stays listed with its outcome, a Redo that re-raises it, and a Dismiss that clears it for good.
+The repository is not published yet. There is no working public install link in this release.
 
-## Install
+Extract the release ZIP. Choose the Hermes home belonging to the desktop/backend you intend to extend, then copy these files:
 
-From the Hermes Desktop app: **Capabilities → Plugins → Install from Git** and point it at this repo, or use the one-click link:
-
-`hermes://plugin/install?repo=jerrygooch/hermes-desktop-action-center&enable=1`
-
-Two switches gate it, on purpose:
-
-1. The desktop half is opt-in and starts disabled; flip it on in **Capabilities → Plugins**.
-2. The Python backend is imported only when `action-center` is in `plugins.enabled` in your `config.yaml` (a security boundary, not an oversight). Add it there and restart the backend. Until then the UI loads and politely reports that its backend is off.
-
-## How it works
-
-```
-dashboard/plugin_api.py   FastAPI router at /api/plugins/action-center/ (mounted by the gateway)
-dashboard/manifest.json   declares the backend
-desktop/plugin.js         the desktop half: status chip, full page, sidebar nav, palette commands
+```text
+Archive                                 Destination below HERMES_HOME
+-------------------------------------   --------------------------------------------
+action-center/desktop/plugin.js          desktop-plugins/action-center/plugin.js
+action-center/dashboard/manifest.json    plugins/action-center/dashboard/manifest.json
+action-center/dashboard/plugin_api.py    plugins/action-center/dashboard/plugin_api.py
 ```
 
-The UI talks only to its own backend namespace via `ctx.rest`. The backend runs inside the gateway process and reads session state the same way the core does (the same managers, the same locks), which is why pause/resume lands exactly like the slash commands leave it.
+1. Back up your configuration and any existing Action Center files.
+2. Add `action-center` to the existing `plugins.enabled` list in that home's `config.yaml`. Preserve its other entries. An entry in `plugins.disabled` takes precedence, so remove that entry if you intend to enable this plugin.
+3. Restart that backend. Python backend changes do not hot-reload.
+4. Enable Action Center in Desktop's **Capabilities → Plugins**. The desktop half starts disabled.
+5. Open the labeled Action Center status chip. The panel reports which profile was scanned and any coverage errors.
+
+Both halves must be installed. A desktop file by itself cannot read the gateway queues. To disable, turn off the desktop plugin, remove its backend allow-list entry or add it to `plugins.disabled`, and restart the backend. Remove the copied files only after disabling. Persisted history is not deleted by uninstalling.
+
+## Expiry history and coverage
+
+The backend registers observer hooks on its first summary/detail read. It records authoritative timeout, notification-failure and cancellation outcomes for human-facing sessions in its launch profile. It does not replace the gateway's notification or settlement callback, and it does not guess that a disappearing request expired.
+
+History covers only settlements observed while this gateway process and its observer were active. It cannot reconstruct events before activation, a process crash, or another gateway's requests. When you view a different profile through the same gateway, existing records remain readable, but new capture belongs to that profile's own gateway process. The panel labels observed-only history; unavailable capture and read/write failures are surfaced rather than reported as an all-clear.
+
+Compatible records already persisted by a supporting gateway remain usable. Stored-session pause/resume changes persisted automation state; it does not start a session. Open a session before using Redo. Normal approval checks still apply when the agent retries.
+
+## Compatibility and verification
+
+Version 0.1.0 was tested on Windows with a packaged Hermes Desktop test build and both the unpatched baseline backend and the feature-reference checkout. See `RELEASE.md` in the source repository for exact revisions, commands, results and test boundaries. This is a local release; publishing and installation into a daily home are separate actions.
+
+The UI imports only `@hermes/plugin-sdk`, `react`, and `react/jsx-runtime`. Its API calls stay under `/api/plugins/action-center/`. Optional desktop host APIs are feature-detected. Backend internals are imported lazily; missing capabilities produce visible errors or coverage warnings.
 
 ## Development
 
-- UI smoke runs offline with no app: `node tests/smoke/run.mjs` loads `desktop/plugin.js` against stubbed SDK and react modules, walks every render with populated, empty and error data, and asserts the registered contributions.
-- Backend tests: `python -m pytest tests/test_plugin_api.py` run from a Hermes checkout root (so `tui_gateway` and `hermes_cli` import); the fixtures stand up a temp `HERMES_HOME` with a real `state.db`.
-- Live iteration: drop `desktop/plugin.js` into `$HERMES_HOME/desktop-plugins/action-center/` and the app hot-reloads it on every save. The backend is imported when the gateway starts, so backend edits need the gateway recycled.
+```text
+node tests/smoke/run.mjs
+python -m unittest discover -s tests -p test_release_package.py -v
+python scripts/package_release.py
+```
 
-## Status
+Run the backend suite from a compatible Hermes checkout, using an interpreter with that checkout's dependencies and an absolute path to this repository's test file:
 
-v0.1.0, under review. Automated results and limitations are recorded in `REVIEW.md`; passing offline tests are not a claim of live desktop verification.
+```text
+python -m pytest -p no:cacheprovider /absolute/path/to/action-center/tests/test_plugin_api.py
+```
 
-**Expired-request capture requires gateway support.** This plugin can read, redo, and dismiss persisted expiry records, but it does not install an approval-settle hook into an unpatched gateway. Automatic capture therefore requires a gateway that already writes the compatible records. Without that support, the expired-request section is not a complete timeout history. A plugin-only alternative would track requests it actually observed and retain a clearly labeled, incomplete history; polling cannot reliably infer whether a disappearing request was answered or expired.
+Set `PYTHONDONTWRITEBYTECODE=1` when verifying read-only checkouts. The smoke harness rebuilds its synthetic SDK/React modules from tracked stubs; no npm install is required. `tests/live/README.md` documents the packaged-app acceptance runner and its isolated, credential-free fixtures.
 
-The install link above is a proposed distribution address; the repository has not yet been published.
+The package builder includes only the three plugin files listed above, README/LICENSE, and a SHA-256 inventory. Test plugins, local receipts, credentials and Git metadata are excluded. Packaging alone does not imply test acceptance.
 
 ## License
 

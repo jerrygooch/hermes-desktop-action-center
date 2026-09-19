@@ -48,6 +48,7 @@ def hermes_home(tmp_path, monkeypatch):
     """Isolated persisted-manager database + state.db for every test."""
     home = tmp_path / ".hermes"
     home.mkdir()
+    (home / 'config.yaml').write_text('plugins:\n  enabled: [action-center]\n', encoding='utf-8')
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
     from hermes_cli import goals
@@ -66,7 +67,14 @@ def server(hermes_home, monkeypatch):
     monkeypatch.setattr(mod, "_cfg_path", None)
     monkeypatch.setattr(mod, "_db", None)
     monkeypatch.setattr(mod, "_db_error", None)
+    # Model a mounted, consent-enabled USER dashboard plugin, never bundled trust.
+    plugin_api.unregister_observed_request_producer()
+    monkeypatch.setattr(plugin_api, '_dashboard_discovery', lambda: ([{
+        'name': 'action-center', 'source': 'user', 'version': '0.1.0',
+        '_dir': str(_PLUGIN_API_PATH.parent),
+    }], None))
     yield mod
+    plugin_api.unregister_observed_request_producer()
     mod._sessions.clear()
     mod._server_requests.reset_for_tests()
     from tools import approval
@@ -2024,3 +2032,383 @@ def _server_module():
     import tui_gateway.server as mod
 
     return mod
+
+
+# ── observed requests: the standalone producer (TDD RED → GREEN) ──────────────
+class TestObservedRequestsProducer:
+    """The plugin's own producer for requests that ended unanswered.
+
+    The core's expired-request WRITER is the gateway's approval-settle hook
+    (``server._emit_approval_request``), which a plugin must not patch — and
+    ``register_gateway_settle`` REPLACES the single settle callback, so touching
+    it would steal the TUI's request withdrawal. The supported production seam is
+    the observer-only plugin hook ``post_approval_response`` (a ``VALID_HOOK`` in
+    ``hermes_cli.plugins``), fired by ``tools.approval_gateway_wait`` on EVERY
+    settlement path with an authoritative outcome: an answered choice, or the
+    fail-closed non-answers ``timeout`` / ``notify_failed`` / ``cancelled`` —
+    never an inference from a request disappearing from the queue.
+    """
+
+    def _hook_kwargs(self, *, choice="timeout", session_key=None, command="rm -rf /tmp/probe"):
+        return {
+            "command": command,
+            "description": "run removal",
+            "pattern_key": "rm:-rf",
+            "pattern_keys": ["rm:-rf"],
+            "session_key": session_key if session_key is not None else _new_key(),
+            "surface": "gateway",
+            "choice": choice,
+        }
+
+    _fired: list = []
+
+    def test_timeout_settlement_is_recorded(self, server, db, monkeypatch):
+        key = _create_row(db, _new_key())
+        session = self._hook_kwargs(session_key=key)
+        self._register_hook(monkeypatch, session, server)
+        try:
+            entry = self._settle_via_queue(server, db, key)
+            records = plugin_api.load_expired_requests(db, key)
+            assert [r["request_id"] for r in records] == [entry.data["request_id"]]
+            record = records[0]
+            assert record["outcome"] == "timeout"
+            assert record["command"] == entry.data["command"]
+            assert record["description"] == entry.data["description"]
+            assert record["pattern_keys"] == [str(k) for k in (entry.data.get("pattern_keys") or ["rm:-rf"])]
+        finally:
+            plugin_api.unregister_observed_request_producer()
+
+    def test_notify_failed_settlement_is_recorded(self, server, db, monkeypatch):
+        key = _create_row(db, _new_key())
+        self._register_hook(monkeypatch, self._hook_kwargs(choice="notify_failed", session_key=key), server)
+        try:
+            from tools import approval as _approval
+
+            entry = self._settle_via_queue_directly(db, key, _approval=_approval)
+            plugin_api._observe_pre_approval_request(
+                choice="pre", session_key=key, command=entry.data["command"],
+                request_id=entry.data["request_id"], surface="gateway")
+            plugin_api._on_post_approval_response(self._hook_kwargs(
+                choice="notify_failed", session_key=key, command=entry.data["command"]))
+            records = plugin_api.load_expired_requests(db, key)
+            assert [r["request_id"] for r in records] == [entry.data["request_id"]]
+            assert records[0]["outcome"] == "notify_failed"
+        finally:
+            plugin_api.unregister_observed_request_producer()
+
+    def test_session_closed_settlement_is_recorded(self, server, db, monkeypatch):
+        key = _create_row(db, _new_key())
+        self._register_hook(monkeypatch, self._hook_kwargs(choice="cancelled", session_key=key), server)
+        try:
+            entry = self._settle_via_queue_directly(db, key)
+            plugin_api._observe_pre_approval_request(
+                choice="pre", session_key=key, command=entry.data["command"],
+                request_id=entry.data["request_id"], surface="gateway")
+            plugin_api._on_post_approval_response(self._hook_kwargs(
+                choice="cancelled", session_key=key, command=entry.data["command"]))
+            records = plugin_api.load_expired_requests(db, key)
+            assert [r["request_id"] for r in records] == [entry.data["request_id"]]
+            assert records[0]["outcome"] == "session_closed"
+        finally:
+            plugin_api.unregister_observed_request_producer()
+
+    def test_answered_choices_are_not_recorded(self, server, db, monkeypatch):
+        for choice in ("once", "session", "always", "deny"):
+            key = _create_row(db, _new_key())
+            self._register_hook(monkeypatch, self._hook_kwargs(choice=choice, session_key=key), server)
+            try:
+                plugin_api._on_post_approval_response(self._hook_kwargs(choice=choice, session_key=key))
+                assert plugin_api.load_expired_requests(db, key) == []
+            finally:
+                plugin_api.unregister_observed_request_producer()
+
+    def test_unregistered_producer_records_nothing(self, server, db, monkeypatch):
+        key = _create_row(db, _new_key())
+        # The producer is never registered here: the callback alone must not record.
+        plugin_api.unregister_observed_request_producer()
+        plugin_api._on_post_approval_response(self._hook_kwargs(session_key=key))
+        assert plugin_api.load_expired_requests(db, key) == []
+        assert plugin_api.load_expired_request_counts(db) == ({}, None)
+
+    def test_unknown_session_is_never_recorded(self, server, db, monkeypatch):
+        self._register_hook(monkeypatch, self._hook_kwargs(session_key=_new_key()), server)
+        try:
+            plugin_api._on_post_approval_response(self._hook_kwargs(session_key=_new_key("ghost")))
+            assert plugin_api.load_expired_request_counts(db) == ({}, None)
+        finally:
+            plugin_api.unregister_observed_request_producer()
+
+    def test_allowlisted_session_scope_enforced(self, server, db, monkeypatch):
+        """A session key belonging to a deny-listed source must never be recorded."""
+        key = _create_row(db, _new_key(), source="kanban")
+        self._register_hook(monkeypatch, self._hook_kwargs(session_key=key), server)
+        try:
+            plugin_api._on_post_approval_response(self._hook_kwargs(session_key=key))
+            assert plugin_api.load_expired_request_counts(db) == ({}, None)
+        finally:
+            plugin_api.unregister_observed_request_producer()
+
+    def test_cancelled_cause_records_session_closed_even_as_deny(self, server, db, monkeypatch):
+        """The core fires ``choice='deny'`` WITH ``cancelled=<cause>`` when the
+        wait was interrupted: a withdrawal nobody made — recorded as
+        session_closed, never mislabeled as a user deny."""
+        key = _create_row(db, _new_key())
+        self._register_hook(monkeypatch, self._hook_kwargs(session_key=key), server)
+        try:
+            plugin_api._on_post_approval_response(self._hook_kwargs(
+                choice="deny", session_key=key))
+            assert plugin_api.load_expired_requests(db, key) == []  # no cause: a real deny
+            kw = self._hook_kwargs(choice="deny", session_key=key)
+            kw["cancelled"] = "turn interrupted"
+            plugin_api._on_post_approval_response(kw)
+            records = plugin_api.load_expired_requests(db, key)
+            assert len(records) == 1
+            assert records[0]["outcome"] == "session_closed"
+        finally:
+            plugin_api.unregister_observed_request_producer()
+
+    def test_payload_is_redacted_before_persistence(self, server, db, monkeypatch):
+        """A credential-shaped command never reaches the store, whichever gate
+        fired the hook (the CLI gate passes unredacted copies)."""
+        key = _create_row(db, _new_key())
+        self._register_hook(monkeypatch, self._hook_kwargs(session_key=key), server)
+        try:
+            plugin_api._on_post_approval_response(self._hook_kwargs(
+                choice="timeout", session_key=key,
+                command="echo api_key=sk-supersecret-token-value run"))
+            record = plugin_api.load_expired_requests(db, key)[0]
+            assert "sk-supersecret-token-value" not in json.dumps(record)
+        finally:
+            plugin_api.unregister_observed_request_producer()
+
+    def test_allowlist_gate_blocks_when_probe_fails(self, server, db, monkeypatch):
+        """Fail closed: when the durable-row probe itself raises, nothing is recorded."""
+        key = _create_row(db, _new_key())
+        self._register_hook(monkeypatch, self._hook_kwargs(session_key=key), server)
+        try:
+            def boom(_params):
+                raise RuntimeError("canary-secret-probe")
+            monkeypatch.setattr(server, "_profile_db", boom)
+            plugin_api._on_post_approval_response(self._hook_kwargs(session_key=key))
+            assert plugin_api.load_expired_request_counts(db) == ({}, None)
+        finally:
+            plugin_api.unregister_observed_request_producer()
+
+    def test_bounded_redacted_payload(self, server, db, monkeypatch):
+        """Persisted fields are hard-bounded and carry the redacted display copy."""
+        key = _create_row(db, _new_key())
+        self._register_hook(monkeypatch, self._hook_kwargs(session_key=key), server)
+        try:
+            huge_command = "rm " + "x" * 4000
+            plugin_api._on_post_approval_response(self._hook_kwargs(
+                choice="timeout", session_key=key, command=huge_command))
+            record = plugin_api.load_expired_requests(db, key)[0]
+            assert len(record["command"]) <= 500
+            assert len(record["description"]) <= 300
+            assert record["command"].startswith("rm ")
+            assert json.dumps(record)  # JSON-serializable durable row
+        finally:
+            plugin_api.unregister_observed_request_producer()
+
+    def test_registration_is_idempotent_and_unregisters_cleanly(self, server, db, monkeypatch):
+        key = _create_row(db, _new_key())
+        self._register_hook(monkeypatch, self._hook_kwargs(session_key=key), server)
+        assert plugin_api.register_observed_request_producer(server) is False  # no double hook
+        try:
+            entry = self._settle_via_queue_directly(db, key)
+            plugin_api._observe_pre_approval_request(
+                choice="pre", session_key=key, command=entry.data["command"],
+                request_id=entry.data["request_id"], surface="gateway")
+            plugin_api._on_post_approval_response(self._hook_kwargs(
+                choice="timeout", session_key=key, command=entry.data["command"]))
+            records = plugin_api.load_expired_requests(db, key)
+            assert len(records) == 1  # one producer, one record — no duplicates
+        finally:
+            plugin_api.unregister_observed_request_producer()
+
+    def test_no_ownership_claim_without_recorded_settlement(self, server, db, monkeypatch):
+        """An approval that is merely queued (not settled) leaves no record: the
+        producer never infers expiry from a request that has not ended."""
+        key = _create_row(db, _new_key())
+        self._register_hook(monkeypatch, self._hook_kwargs(session_key=key), server)
+        try:
+            self._settle_via_queue_directly(db, key, settle=False)
+            assert plugin_api.load_expired_requests(db, key) == []
+        finally:
+            plugin_api.unregister_observed_request_producer()
+
+    def test_read_route_registers_producer_and_survives_failure(self, server, db, monkeypatch):
+        """The first read lazily registers the producer (import time is too
+        early: plugin discovery has not run) and a failing registration never
+        fails the read."""
+        key = _create_row(db, _new_key())
+        plugin_api.unregister_observed_request_producer()
+        calls = []
+
+        def real_register(srv=None):
+            calls.append(srv)
+            return plugin_api.register_observed_request_producer.__wrapped__(srv) if False else True
+
+        # Simulate the LIVE production behavior without the real plugin system:
+        # patch the register seam to a no-op True so the read proceeds.
+        monkeypatch.setattr(plugin_api, "register_observed_request_producer",
+                            lambda srv=None: calls.append(srv) or True)
+        out = plugin_api.action_center_summary()
+        assert out["badge"] in ("none", "amber", "red")
+        assert len(calls) == 1  # exactly one lazy attempt per read
+        plugin_api.unregister_observed_request_producer()
+
+        # And when registration raises, the read still completes.
+        def boom(srv=None):
+            raise RuntimeError("canary-register")
+        monkeypatch.setattr(plugin_api, "register_observed_request_producer", boom)
+        out2 = plugin_api.action_center_summary()
+        assert out2["badge"] in ("none", "amber", "red")
+
+    # -- helpers -------------------------------------------------------------
+
+    def _settle_via_queue(self, server, db, key):
+        """Queue ONE entry, fire the PRE hook (captures request_id), then the
+        POST hook with the authoritative settlement — the exact sequence
+        ``tools.approval_gateway_wait`` produces for a timeout."""
+        rid = _queue_approval(server, key)
+        with approval._lock:
+            entry = approval._gateway_queues[key][0]
+        plugin_api._observe_pre_approval_request(
+            choice="pre", session_key=key,
+            command=entry.data["command"],
+            description=entry.data["description"],
+            pattern_keys=[str(k) for k in (entry.data.get("pattern_keys") or [])],
+            request_id=entry.data["request_id"], surface="gateway")
+        with approval._lock:
+            approval._gateway_queues[key].remove(entry)
+            if not approval._gateway_queues.get(key):
+                approval._gateway_queues.pop(key, None)
+        self._fired.append({
+            "choice": "timeout",
+            "session_key": key,
+            "command": entry.data["command"],
+            "description": entry.data["description"],
+            "pattern_keys": [str(k) for k in (entry.data.get("pattern_keys") or ["rm:-rf"])],
+        })
+        plugin_api._on_post_approval_response(self._fired[-1])
+        return entry
+
+    def _settle_via_queue_directly(self, db, key, *, settle=True, _approval=None):
+        """Queue one entry WITHOUT arming a settle hook (the producer path); the
+        test fires the hook callback itself with the authoritative outcome."""
+        _approval = _approval or approval
+        rid = _queue_approval(_server_module(), key)
+        with _approval._lock:
+            entry = _approval._gateway_queues[key][0]
+            _approval._gateway_queues[key].remove(entry)
+            if not _approval._gateway_queues.get(key):
+                _approval._gateway_queues.pop(key, None)
+        return entry
+
+    def _register_hook(self, monkeypatch, kwargs, server, *, ensure_unregistered_first=True):
+        """Register the producer with its OWN honest identity (source='user' —
+        what the dashboard host mounts a user-installed plugin as) and wire
+        lifecycle.invoke_hook → the plugin's own callback (the SUPPORTED hook
+        seam the core documents for plugins)."""
+        from hermes_cli.plugins_manifest import PluginManifest
+
+        if ensure_unregistered_first:
+            plugin_api.unregister_observed_request_producer()
+        registered = plugin_api.register_observed_request_producer(server)
+        assert registered is True
+        from hermes_cli import lifecycle
+
+        monkeypatch.setattr(lifecycle, "_observe", lambda *a, **k: None)
+
+        def fake_invoke(hook_name, **kw):
+            if hook_name == "post_approval_response":
+                plugin_api._on_post_approval_response(kw)
+            elif hook_name == "pre_approval_request":
+                plugin_api._observe_pre_approval_request(**kw)
+            return []
+
+        monkeypatch.setattr(lifecycle, "_plugin_hooks", fake_invoke)
+
+
+class TestProducerReleaseGates:
+    def test_identity_must_match_loaded_module_directory(self, server, monkeypatch):
+        monkeypatch.setattr(plugin_api, '_dashboard_discovery', lambda: ([{
+            'name': 'action-center', 'source': 'bundled', '_dir': '/unrelated/dashboard',
+        }], None))
+        assert plugin_api.register_observed_request_producer(server) is False
+        assert plugin_api._observed_request_producer is None
+
+    def test_answered_settlement_consumes_correlation(self, server):
+        assert plugin_api.register_observed_request_producer(server)
+        plugin_api._observe_pre_approval_request(session_key='test-key', request_id='real-rid', command='echo test')
+        assert plugin_api._observed_pending_ids
+        plugin_api._on_post_approval_response(session_key='test-key', choice='once', command='echo test')
+        assert not plugin_api._observed_pending_ids
+
+    def test_partial_registration_disposes_first_hook(self, server, monkeypatch):
+        from hermes_cli.plugins import PluginContext, get_plugin_manager
+        original = PluginContext.register_hook
+        def fail_second(ctx, name, callback):
+            if name == 'pre_approval_request':
+                raise RuntimeError('synthetic registration failure')
+            return original(ctx, name, callback)
+        monkeypatch.setattr(PluginContext, 'register_hook', fail_second)
+        assert not plugin_api.register_observed_request_producer(server)
+        assert plugin_api._on_post_approval_response not in get_plugin_manager()._hooks.get('post_approval_response', [])
+
+    def test_disable_stops_capture_and_read_disposes_hooks(self, server, db, hermes_home):
+        key = _create_row(db, _new_key())
+        assert plugin_api.register_observed_request_producer(server)
+        (hermes_home / 'config.yaml').write_text('plugins:\n  disabled: [action-center]\n', encoding='utf-8')
+        plugin_api._on_post_approval_response(session_key=key, choice='timeout', command='echo test')
+        assert not plugin_api.load_expired_requests(db, key)
+        plugin_api._ensure_producer_for_reads()
+        assert plugin_api._observed_request_producer is None
+
+    def test_unavailable_producer_is_never_all_clear(self, server, db, monkeypatch):
+        monkeypatch.setattr(plugin_api, '_dashboard_discovery', lambda: ([], None))
+        out = plugin_api.action_center_summary()
+        assert out['badge'] == 'red'
+        assert out['coverage']['expired_requests']['observed'] is False
+        assert any('observed requests unavailable' in e for e in out['coverage']['errors'])
+
+    def test_stale_manager_registration_is_recovered(self, server, db):
+        assert plugin_api.register_observed_request_producer(server)
+        old = plugin_api._observed_request_producer
+        old.post_handle.dispose()
+        plugin_api._ensure_producer_for_reads()
+        assert plugin_api._observed_request_producer is not old
+        assert plugin_api._producer_coverage(None)['observed'] is True
+
+    def test_concurrent_registration_has_one_owner(self, server, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+        from hermes_cli.plugins import PluginContext
+        entered = threading.Event()
+        release = threading.Event()
+        original = PluginContext.register_hook
+        calls = []
+        def delayed(ctx, name, callback):
+            calls.append(name)
+            if name == 'post_approval_response':
+                entered.set()
+                assert release.wait(3)
+            return original(ctx, name, callback)
+        monkeypatch.setattr(PluginContext, 'register_hook', delayed)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(plugin_api.register_observed_request_producer, server)
+            assert entered.wait(2)
+            second = pool.submit(plugin_api.register_observed_request_producer, server)
+            time.sleep(0.1)
+            release.set()
+            assert sorted([first.result(3), second.result(3)]) == [False, True]
+        assert calls.count('post_approval_response') == 1
+
+    def test_capture_write_failure_is_visible_in_coverage(self, server, db, monkeypatch):
+        key = _create_row(db, _new_key())
+        assert plugin_api.register_observed_request_producer(server)
+        monkeypatch.setattr(plugin_api, 'record_expired_request', lambda *a: False)
+        plugin_api._on_post_approval_response(session_key=key, choice='timeout', command='echo test')
+        result = plugin_api.action_center_summary()
+        assert result['badge'] == 'red'
+        assert any('capture' in e for e in result['coverage']['errors'])

@@ -37,11 +37,12 @@ writeFileSync(path.join(here, 'plugin.js'), readFileSync(path.join(repoRoot, 'de
 
 const mod = await import('./plugin.js')
 const plugin = mod.default
+const acResponsive = mod.acResponsive
 
 const { renderPass, invokeComponent, clickableByText, collectByType, collectBranchClickables, flattenTexts, childText } = await import('./walker.mjs')
 const {
   SUMMARY_POPULATED, SUMMARY_EMPTY, SUMMARY_PARTIAL, DETAILS_POPULATED, DETAILS_RESTRICTED,
-  SUMMARY_KEY_LIVE, DETAILS_KEY_LIVE
+  SUMMARY_KEY_LIVE, DETAILS_KEY_LIVE, ITEMS
 } = await import('./fixtures.mjs')
 
 let failed = 0
@@ -49,6 +50,27 @@ const checks = []
 const check = (name, ok, detail) => {
   checks.push([name, ok, detail])
   if (!ok) failed++
+}
+
+// Rail-posture helper for steps 6b/6d: re-renders the page and returns the rail
+// element (key 'rail', matched by the plugin's own data hook since PanelBody is
+// a Stub frag), or null when the rail is not rendered (compact/too-narrow
+// bands).
+const pageRailEl = () => {
+  const root = page.render()
+  const branch = invokeComponent(root.type, root.props, 'render[page-step6b]')
+  const out = []
+  const walk = node => {
+    if (node == null || typeof node !== 'object') return
+    if (Array.isArray(node)) return node.forEach(walk)
+    if (node.__frag) return walk(node.children)
+    if (node.__el) {
+      if (node.props?.['data-ac-rail-panel'] === '') out.push(node)
+      return walk(node.props?.children)
+    }
+  }
+  walk(branch)
+  return out[0] || null
 }
 
 const renderErrors = [] // [path, error]
@@ -77,6 +99,16 @@ function makeCtx() {
 const reactStub = await import('react')
 const sdkStub = await import('@hermes/plugin-sdk')
 
+// DOM shims for the plugin's real effect contract (the walker is not a
+// browser): a `window` for the effect's resize listener and a ResizeObserver
+// whose latest instance the harness fires after a simulated size change.
+globalThis.window = globalThis.window || { addEventListener() {}, removeEventListener() {} }
+globalThis.ResizeObserver = class {
+  constructor(callback) { globalThis.__AC_LAST_OBSERVER = { callback, observed: null } }
+  observe(node) { if (globalThis.__AC_LAST_OBSERVER) globalThis.__AC_LAST_OBSERVER.observed = node }
+  disconnect() {}
+}
+
 // Fresh scenario: wipe injected data/errors/REST scripting/observations AND the
 // react stub's hook slots, so each step's renders start from initial state.
 function resetGlobals() {
@@ -86,6 +118,9 @@ function resetGlobals() {
   restCalls.length = 0
   renderErrors.length = 0
   reactStub.__resetForHarness()
+  // The page remounts per scenario: clear the measured-width bookkeeping so a
+  // fresh instance starts unmeasured (no cross-instance state to leak).
+  reactStub.__clearRefsForHarness()
   sdkStub.host.state.profile.set('default')
 }
 
@@ -199,18 +234,50 @@ check('expanded walk: no render errors', renderErrors.length === 0, renderErrors
   check('batch staging progress label', expanded.texts.some(t => /^\d+ of \d+ answered$/.test(t)), expanded.texts.filter(t => t.includes('answered')).join(' | '))
 }
 
-// ── step 6b (NEW regression): responsive posture ─────────────────────────────
-// Parity with the REAL PanelBody (`min-[47.5rem]:flex-row` → 760px viewport at
-// the app's fixed --dt-base-size: 1rem): below 760px the rail stacks full-width
-// above the list; at/above it the rail is an 11rem side column. `narrow`
-// (640px sidebar collapse) is a different breakpoint and must not gate this.
+// ── step 6b (NEW regression): responsive posture at MEASURED CONTAINER widths ─
+// The docked panel is a container, not the viewport: CSS viewport 1024 →
+// container ~678px, 560 → ~214px, 400 → ~88px (observed live). PanelBody's own
+// `min-[47.5rem]:flex-row` split reads the VIEWPORT, so a wide viewport with a
+// narrow container would still split — and vice versa. The plugin therefore
+// measures its own body with a ResizeObserver (useMeasuredContainer returns
+// [ref, width]; null width until the real effect measures) and controls the
+// ACTUAL body direction itself via a measured split wrapper: row only when the
+// measured width reaches RAIL_STACK_MIN_PX. Contract (acResponsive):
+//   ≤RAIL_COMPACT_MAX (≤420):    rail becomes a horizontal compact strip
+//                                (collapsible via the SDK Button); the full
+//                                11rem rail must NEVER render — it would
+//                                starve the detail.
+//   RAIL_STACK_MIN (420 < w < 760): stacked rail above the list.
+//   ≥RAIL_STACK_MIN (≥760):      11rem side rail beside the list.
+//   <RAIL_MIN (min-width):       honest "too narrow to use" affordance with an
+//                                expand action instead of silently clipping at
+//                                absurd widths (live showed 88px).
+// The harness simulates the real DOM contract: the measured node gets
+// offsetWidth from a stub node; the ref reaches the effect; the effect's
+// measure callback re-renders with the new width.
 
 resetGlobals()
 globalThis.__AC_DATA = { [SUMMARY_KEY_LIVE]: SUMMARY_POPULATED }
 {
-  const railEl = () => {
-    // page.render() is the ActionCenterPage element; its body is the invoked
-    // branch. Invoke with the same scope renderPass used so hook slots line up.
+  // Real-effect driver: render → flush the mount effect (registers the RO and
+  // takes the first measure), assign the measured node to the body ref the way
+  // a real commit would, then fire the ResizeObserver — the same path a real
+  // browser takes (effect → RO fires → setState). No test-only production
+  // hooks: this drives the plugin's actual useRef/useEffect/ResizeObserver.
+  const mountMeasure = async width => {
+    renderPass(page, 'render:page[posture]', renderErrors, 'page-step6b')
+    reactStub.__flushEffectsForHarness()
+    const slot = reactStub.__lastRefForHarness('render[page-step6b]>ActionCenterPage#0')
+    if (slot == null) return null
+    slot.current = { offsetWidth: width }
+    reactStub.__runObserverForHarness()
+    reactStub.__flushEffectsForHarness()
+    return renderPass(page, 'render:page[posture]', renderErrors, 'page-step6b')
+  }
+
+  // Split-wrapper helper: re-renders the page and returns the measured split
+  // wrapper element (key 'ac-split', matched by data-ac-split), or null.
+  const splitEl = () => {
     const root = page.render()
     const branch = invokeComponent(root.type, root.props, 'render[page-step6b]')
     const out = []
@@ -219,31 +286,189 @@ globalThis.__AC_DATA = { [SUMMARY_KEY_LIVE]: SUMMARY_POPULATED }
       if (Array.isArray(node)) return node.forEach(walk)
       if (node.__frag) return walk(node.children)
       if (node.__el) {
-        if (node.key === 'rail') out.push(node)
+        if (node.props?.['data-ac-split'] === '') out.push(node)
         return walk(node.props?.children)
       }
     }
     walk(branch)
     return out[0] || null
   }
-  sdkStub.host.state.viewport.set({ width: 1280, height: 800, narrow: false })
-  const wide = renderPass(page, 'render:page[wide]', renderErrors, 'page-step6b')
-  const wideRail = railEl()
-  check('wide viewport renders the section rail', wide.texts.includes('All sessions'), wide.texts.join(' | '))
-  check('wide viewport keeps the 11rem side rail', wideRail?.props?.style?.width === '11rem', JSON.stringify(wideRail?.props?.style))
-  // The previously-broken 640–759px band: PanelBody stacks below 47.5rem even
-  // though the sidebar-collapse `narrow` flag is still false.
-  sdkStub.host.state.viewport.set({ width: 700, height: 700, narrow: false })
-  renderPass(page, 'render:page[700px]', renderErrors, 'page-step6b')
-  const midRail = railEl()
-  check('700px viewport stacks the rail (PanelBody 47.5rem parity)', midRail?.props?.style?.width === '100%', JSON.stringify(midRail?.props?.style))
-  // Well below the breakpoint: stacked rail, list still renders rows.
-  sdkStub.host.state.viewport.set({ width: 500, height: 700, narrow: true })
-  const narrow = renderPass(page, 'render:page[narrow]', renderErrors, 'page-step6b-narrow')
-  const narrowRail = railEl()
-  check('narrow viewport stacks the rail full-width', narrowRail?.props?.style?.width === '100%', JSON.stringify(narrowRail?.props?.style))
-  check('narrow viewport still renders rail + rows', narrow.texts.includes('All sessions') && narrow.rows.some(row => row.rowKey === 'gallery-goals' && row.title === 'Deploy pipeline'), JSON.stringify(narrow.rows.map(row => row.rowKey)))
-  sdkStub.host.state.viewport.set({ width: 1280, height: 800, narrow: false })
+
+  const WIDE = { width: 1280, height: 800, narrow: false }
+  const NARROW = { width: 560, height: 700, narrow: true } // live: ~214px container
+  const TINY = { width: 400, height: 700, narrow: true } // live: ~88px container
+  // The viewport is passed EXPLICITLY per band so the discriminating cases are
+  // real: e.g. measured 678px under a WIDE viewport is the case PanelBody's
+  // own min-[47.5rem] media query gets wrong.
+  const measure = async (width, vp) => {
+    sdkStub.host.state.viewport.set(vp)
+    const pass = await mountMeasure(width)
+    return pass
+  }
+
+  // WIDE: 1024px measured container (wide viewport) → 11rem side rail, row
+  // split, rows live.
+  {
+    const wide = await measure(1024, WIDE)
+    const wideRail = splitEl()?.props?.children?.find(c => c?.props?.['data-ac-rail-panel'] === '')
+    check('wide container: split wrapper renders in row direction', splitEl()?.props?.style?.flexDirection === 'row', JSON.stringify(splitEl()?.props?.style))
+    check('wide container renders the section rail', wide.texts.includes('All sessions'), wide.texts.join(' | '))
+    check('wide container keeps the 11rem side rail', wideRail?.props?.style?.width === '11rem', JSON.stringify(wideRail?.props?.style))
+    check('page body carries the measured-container contract', Boolean(splitEl()), 'split wrapper found')
+    check('wide container: PanelBody is NOT the split owner', Boolean(splitEl()?.props?.style?.flexDirection === 'row' && splitEl()?.props?.style?.width === '100%'), JSON.stringify(splitEl()?.props?.style))
+  }
+
+  // The 678px container under a WIDE VIEWPORT (live 1024px CSS viewport): this
+  // is the case a viewport-driven posture gets wrong — the page body must
+  // still STACK (measured 678 < 760) even though PanelBody's own min-[47.5rem]
+  // media query would split. 678px container stacks the rail, rows stay live.
+  {
+    const at678 = await measure(678, WIDE) // viewport stays WIDE on purpose
+    const rail = splitEl()?.props?.children?.find(c => c?.props?.['data-ac-rail-panel'] === '')
+    check('stacked band: container 678px under wide viewport stacks the rail (measured, not viewport)', splitEl()?.props?.style?.flexDirection === 'column' && rail?.props?.style?.width === '100%', JSON.stringify({ split: splitEl()?.props?.style, rail: rail?.props?.style }))
+    check('stacked band: container 678px under wide viewport still renders rows', at678.rows.some(r => r.rowKey === 'gallery-goals' && r.title === 'Deploy pipeline'), JSON.stringify(at678.rows.map(r => r.rowKey)))
+    check('stacked band: 700px measured container stacks too', (await measure(700, WIDE)) && splitEl()?.props?.style?.flexDirection === 'column', JSON.stringify(splitEl()?.props?.style))
+  }
+
+  // Compact band: 214px container (narrow viewport). The full 11rem rail column
+  // MUST NOT render (it would starve the detail); instead a collapsible
+  // compact strip (SDK Button toggle + icon rows) shares the row with the
+  // list. Rows stay reachable.
+  {
+    const compact = await measure(214, NARROW)
+    const rail = splitEl()?.props?.children?.find(c => c?.props?.['data-ac-rail-panel'] === '')
+    check('compact container drops the full rail column (214px)', rail === undefined || rail?.props?.style?.width === 'auto', JSON.stringify(rail?.props?.style))
+    check('compact container never reserves the 11rem column', rail?.props?.style?.width !== '11rem', JSON.stringify(rail?.props?.style))
+    check('compact container offers an accessible rail toggle', compact.clickables.some(b => b.props?.['data-ac-rail-toggle'] != null && typeof b.props?.['aria-expanded'] === 'boolean' && typeof b.props?.['aria-label'] === 'string' && b.props['aria-label'].includes('section')), compact.clickables.map(b => b.props?.['aria-label']).join(' | '))
+    {
+      // The toggle must actually flip: collapsed default → expanded → collapsed.
+      const toggle = compact.clickables.find(b => b.props?.['data-ac-rail-toggle'] != null)
+      if (toggle) {
+        await toggle.props.onClick()
+        const opened = renderPass(page, 'render:page[posture]', renderErrors, 'page-step6b')
+        const openToggle = opened.clickables.find(b => b.props?.['data-ac-rail-toggle'] != null)
+        check('compact rail toggle expands (aria-expanded → true, rows appear)', openToggle?.props?.['aria-expanded'] === true && opened.clickables.some(b => b.props?.['data-ac-rail'] != null), JSON.stringify({ expanded: openToggle?.props?.['aria-expanded'] }))
+        if (openToggle) {
+          await openToggle.props.onClick()
+          const closed = renderPass(page, 'render:page[posture]', renderErrors, 'page-step6b')
+          const closedToggle = closed.clickables.find(b => b.props?.['data-ac-rail-toggle'] != null)
+          check('compact rail toggle collapses again (aria-expanded → false)', closedToggle?.props?.['aria-expanded'] === false && !closed.clickables.some(b => b.props?.['data-ac-rail'] != null), JSON.stringify({ expanded: closedToggle?.props?.['aria-expanded'] }))
+        }
+      } else {
+        check('compact rail toggle expands (aria-expanded → true, rows appear)', false, 'no toggle found')
+      }
+      // Reset the strip to collapsed for the bands below.
+      const resetToggle = renderPass(page, 'render:page[posture]', renderErrors, 'page-step6b').clickables.find(b => b.props?.['data-ac-rail-toggle'] != null)
+      if (resetToggle && resetToggle.props?.['aria-expanded'] === true) await resetToggle.props.onClick()
+      renderPass(page, 'render:page[posture]', renderErrors, 'page-step6b')
+    }
+    check('compact container keeps session rows reachable', compact.rows.some(r => r.rowKey === 'gallery-goals' && r.title === 'Deploy pipeline'), JSON.stringify(compact.rows.map(r => r.rowKey)))
+    {
+      const compactRow = compact.rows.find(r => r.rowKey === 'gallery-goals')
+      if (compactRow) await compactRow.onSelect()
+      const afterExpand = renderPass(page, 'render:page[posture]', renderErrors, 'page-step6b')
+      check('compact container keeps detail content after expansion', Boolean(compactRow) && afterExpand.texts.some(t => String(t).includes('Open full chat')), 'row expansion walk')
+      if (compactRow) await compactRow.onSelect() // collapse again for the next band
+      renderPass(page, 'render:page[posture]', renderErrors, 'page-step6b')
+    }
+  }
+
+  // Absurd width (88px, tiny viewport): no silently clipped UI — an honest
+  // minimum-width notice with an expand affordance instead.
+  {
+    const tiny = await measure(88, TINY)
+    check('88px container shows the too-narrow notice (honest, not clipped)', tiny.texts.some(t => String(t).includes('narrow to use')), tiny.texts.join(' | '))
+    check('88px container offers an expand affordance', tiny.clickables.some(b => String(b.props?.['aria-label'] || childText(b.props?.children)).includes('expand')), tiny.clickables.map(b => b.props?.['aria-label'] || childText(b.props?.children)).join(' | '))
+    check('tiny expand button has visible text', tiny.clickables.some(b => childText(b.props?.children) === 'Expand'))
+    check('88px container does not render the full rail or rows', !tiny.texts.includes('All sessions') && tiny.rows.length === 0, JSON.stringify(tiny.rows.map(r => r.rowKey)))
+  }
+
+  // Container-width plumbing sanity: the exported constants.
+  check('acResponsive constants exported', acResponsive && typeof acResponsive === 'object'
+    && typeof acResponsive.RAIL_STACK_MIN_PX === 'number'
+    && typeof acResponsive.RAIL_COMPACT_MAX_PX === 'number'
+    && typeof acResponsive.RAIL_MIN_PX === 'number', String(acResponsive && Object.keys(acResponsive)))
+  check('acResponsive band order is coherent (compact < stack < sane min)', Boolean(acResponsive) && acResponsive.RAIL_COMPACT_MAX_PX < acResponsive.RAIL_STACK_MIN_PX && acResponsive.RAIL_MIN_PX <= acResponsive.RAIL_COMPACT_MAX_PX, JSON.stringify(acResponsive ? { compact: acResponsive.RAIL_COMPACT_MAX_PX, stack: acResponsive.RAIL_STACK_MIN_PX, min: acResponsive.RAIL_MIN_PX } : acResponsive))
+  check('openWorkspace minWidth is reasonable (not viewport-derived)', Boolean(acResponsive) && acResponsive.OPEN_MIN_WIDTH_PX >= 320 && acResponsive.OPEN_MIN_WIDTH_PX <= 560, String(acResponsive?.OPEN_MIN_WIDTH_PX))
+
+  // The measured posture must survive a scenario reset (no cross-instance
+  // state): a fresh page instance starts UNMEASURED (stacked), then remeasures.
+  {
+    resetGlobals()
+    globalThis.__AC_DATA = { [SUMMARY_KEY_LIVE]: SUMMARY_POPULATED }
+    const fresh = await measure(1024, WIDE)
+    check('fresh instance re-measures after reset (no stale shared width)', splitEl()?.props?.style?.flexDirection === 'row', JSON.stringify(splitEl()?.props?.style))
+    void fresh
+  }
+
+  // Keyboard/focus hygiene on the rail rows (they are raw buttons).
+  await measure(1024, WIDE)
+  const railRoot = splitEl()?.props?.children?.find(c => c?.props?.['data-ac-rail-panel'] === '')
+  const wideRailRows = []
+  const walkRows = node => {
+    if (node == null || typeof node !== 'object') return
+    if (Array.isArray(node)) return node.forEach(walkRows)
+    if (node.__frag) return walkRows(node.children)
+    if (node.__el) {
+      if (node.type === 'button') { wideRailRows.push(node); return }
+      if (typeof node.type === 'function' && node.type.name !== 'Stub') {
+        let inner = null
+        try { inner = invokeComponent(node.type, node.props, 'render[page-step6b]') } catch { return }
+        return walkRows(inner)
+      }
+      return walkRows(node.props?.children)
+    }
+  }
+  walkRows(railRoot)
+  check('rail rows are real buttons (keyboard reachable)', wideRailRows.length > 0 && wideRailRows.every(b => b.props?.type === 'button'), String(wideRailRows.length))
+  check('rail rows keep the session-key data hook for live tests', wideRailRows.every(b => typeof b.props?.['data-ac-rail'] === 'string'), wideRailRows.map(b => b.props?.['data-ac-rail']).join(','))
+
+  await measure(1024, WIDE)
+}
+
+// ── step 6c (NEW regression): long-value wrapping, no horizontal blowouts ────
+// Live narrow failures included text that refused to wrap (keys, commands,
+// cwd). Every long-value surface must carry overflowWrap so the detail column
+// never scrolls sideways at 214px.
+
+resetGlobals()
+// Long session_key + cwd make the wrap contract non-vacuous: PanelMeta renders
+// plain cells, so any ≥20-char raw string value would blow the 214px column out.
+const LONG_KEY = `session-key-${'k'.repeat(64)}`
+globalThis.__AC_DATA = {
+  [SUMMARY_KEY_LIVE]: { ...SUMMARY_POPULATED, items: [{ ...ITEMS[0], session_key: LONG_KEY, cwd: `C:/w/very/deep/${'d'.repeat(64)}` }] },
+  [DETAILS_KEY_LIVE(LONG_KEY)]: DETAILS_POPULATED
+}
+{
+  const offenders = []
+  const passX = renderPass(page, 'render:page[wrap]', renderErrors, 'page-step6c')
+  const row = passX.rows.find(r => (r.rowKey || '').startsWith('session-key-'))
+  if (row) {
+    await row.onSelect()
+    renderPass(page, 'render:page[wrap]', renderErrors, 'page-step6c')
+  }
+  check('expanded detail renders without render errors', renderErrors.length === 0, renderErrors.map(([p, e]) => `${p}: ${e?.message}`).join(' | '))
+  // PanelMeta rows are the only long-value surface the harness can see from the
+  // outside; the plugin must wrap them itself (PanelMeta renders plain cells).
+  const root = page.render()
+  const branch = invokeComponent(root.type, root.props, 'render[page-step6c]')
+  const walkMeta = node => {
+    if (node == null || typeof node !== 'object') return
+    if (Array.isArray(node)) return node.forEach(walkMeta)
+    if (node.__frag) return walkMeta(node.children)
+    if (node.__el) {
+      if (typeof node.type === 'function' && node.type.name === 'PanelMeta') {
+        for (const r of node.props?.rows ?? []) {
+          const valueText = typeof r.value === 'string' ? r.value : flattenTexts(r.value, []).join('')
+          if (valueText.length >= 20) offenders.push(valueText)
+        }
+        return
+      }
+      walkMeta(node.props?.children)
+    }
+  }
+  walkMeta(branch)
+  check('session meta values wrap long keys (no ≥20-char unwrapped meta value)', offenders.length === 0, offenders.slice(0, 3).join(' | '))
 }
 
 // ── step 7: interaction scripting (mutations hit the exact REST routes) ──────
@@ -375,6 +600,16 @@ check('restricted walk: no render errors', renderErrors.length === 0, renderErro
 
 // ── step 9: chip content + palette/chip interactions ─────────────────────────
 
+resetGlobals()
+globalThis.__AC_DATA = { [SUMMARY_KEY_LIVE]: { ...SUMMARY_EMPTY, coverage: { ...SUMMARY_EMPTY.coverage, expired_requests: { observed: true, partial: true } } } }
+{
+  const root = page.render()
+  const tree = invokeComponent(root.type, root.props, 'coverage-scope')
+  check('header declares observed-only expiry scope', String(tree.props.children[0].props.subtitle).includes('observed expiry history'))
+  const node = chip.render()
+  const rendered = invokeComponent(node.type, node.props, 'coverage-chip')
+  check('zero chip makes no unqualified all-clear claim', !rendered.props.title.includes('all quiet') && rendered.props.title.includes('observed'))
+}
 resetGlobals()
 globalThis.__AC_DATA = { [SUMMARY_KEY_LIVE]: SUMMARY_POPULATED }
 {

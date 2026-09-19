@@ -46,7 +46,7 @@ import {
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { useMemo, useRef, useState } from 'react'
+import { useMemo, useRef, useState, useEffect } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 // ── constants ────────────────────────────────────────────────────────────────
@@ -56,10 +56,20 @@ const QUERY_ROOT = ['action-center']
 const SUMMARY_KEY = ['action-center', 'summary']
 const DETAILS_KEY = ['action-center', 'details']
 // Parity with the real PanelBody (apps/desktop/src/app/overlays/panel.tsx):
-// `min-[47.5rem]:flex-row` stacks master/detail below 47.5rem of VIEWPORT
-// width — 760px at the app's fixed --dt-base-size: 1rem — not at the 640px
-// sidebar-collapse `narrow` flag.
+// `min-[47.5rem]:flex-row` splits at 47.5rem of VIEWPORT width — 760px at the
+// app's fixed --dt-base-size: 1rem. The docked panel is a CONTAINER, though:
+// live measurements showed ~678/214/88px of content width at 1024/560/400px
+// viewports, so posture is driven by the measured container, not the viewport.
 const RAIL_STACK_MIN_PX = 760
+// At or below this the rail stops stacking (a 40%-capped strip still steals
+// rows' vertical space at 214px) and becomes a collapsible compact strip.
+const RAIL_COMPACT_MAX_PX = 420
+// Below this the panel is genuinely unusable (live showed 88px of clipped
+// chrome): an honest notice + expand affordance instead of silently rendering.
+const RAIL_MIN_PX = 160
+// host.openWorkspace minWidth — a sane floor so the docked tab is never
+// squeezed below usable width, without pinning the whole main zone.
+const OPEN_MIN_WIDTH_PX = 420
 const REFETCH_MS = 5000
 const UNKNOWN = '—'
 const OTHER_PLACEHOLDER = 'Other (type your answer)'
@@ -258,7 +268,50 @@ function chipStateText(badge, count, errors) {
     return errors > 0 ? `partial — ${errors} read ${errors === 1 ? 'error' : 'errors'}` : 'unsupported / could not read'
   }
   if (badge === 'amber') return `${count} ${count === 1 ? 'request' : 'requests'} need you`
-  return 'all quiet'
+  return 'no pending requests observed'
+}
+
+// ── responsive posture (measured container, not the viewport) ────────────────
+
+/** Band for a measured width: null while unmeasured, else the posture. */
+function postureFor(width) {
+  if (width === null || width === undefined) return null
+  if (width < RAIL_MIN_PX) return 'too-narrow'
+  if (width <= RAIL_COMPACT_MAX_PX) return 'compact'
+  if (width < RAIL_STACK_MIN_PX) return 'stacked'
+  return 'wide'
+}
+
+/** Measure THIS page instance's body element: returns [ref, width]. The ref
+ *  goes on the measured node; the width updates from the real effect — a
+ *  ResizeObserver (offsetWidth is the no-RO fallback), so sash drags and
+ *  re-docks re-band the panel at the CONTAINER's width. Per-component state
+ *  (no module atom): two mounted pages never fight over one measurement, and
+ *  unmount cleanup resets only this instance. */
+function useMeasuredContainer() {
+  const bodyRef = useRef(null)
+  const [width, setWidth] = useState(null)
+  useEffect(() => {
+    const measure = () => {
+      const node = bodyRef.current
+      setWidth(node && typeof node.offsetWidth === 'number' && node.offsetWidth > 0
+        ? node.offsetWidth
+        : null)
+    }
+    measure()
+    let observer = null
+    if (typeof ResizeObserver === 'function') {
+      observer = new ResizeObserver(measure)
+      if (bodyRef.current) observer.observe(bodyRef.current)
+    }
+    window.addEventListener('resize', measure)
+    return () => {
+      if (observer) observer.disconnect()
+      window.removeEventListener('resize', measure)
+      setWidth(null)
+    }
+  }, [])
+  return [bodyRef, width]
 }
 
 // ── data plumbing ────────────────────────────────────────────────────────────
@@ -297,6 +350,9 @@ function openPanel(ctx) {
   if (typeof host?.openWorkspace === 'function') {
     host.openWorkspace('action-center', {
       title: 'Action Center',
+      // Sane floor (px): the docked tab stays wide enough to use. 420px keeps
+      // the compact rail band (≤420) reachable while never going absurd-narrow.
+      minWidth: OPEN_MIN_WIDTH_PX,
       render: () => jsx(ActionCenterPage, { ctx })
     })
   } else if (typeof host?.navigate === 'function') {
@@ -312,14 +368,19 @@ function MetaPill({ status }) {
     : UNKNOWN
 }
 
-function RailRow({ active, codicon, count, dim, dotStyle, label, onClick }) {
+function RailRow({ active, codicon, count, dim, dotStyle, label, onClick, compact, railId }) {
   return jsxs('button', {
     type: 'button',
     onClick,
     'aria-pressed': Boolean(active),
+    // Stable hook for live tests: [data-ac-rail="<id>"].
+    'data-ac-rail': railId ?? label,
+    // Icon-only compact rows keep the name accessible.
+    ...(compact ? { 'aria-label': label, title: label } : {}),
     style: {
       display: 'flex',
-      width: '100%',
+      width: compact ? 'auto' : '100%',
+      flexShrink: 0,
       height: 28,
       alignItems: 'center',
       gap: 8,
@@ -337,12 +398,14 @@ function RailRow({ active, codicon, count, dim, dotStyle, label, onClick }) {
       dotStyle
         ? jsx('span', { 'aria-hidden': true, style: { width: 6, height: 6, borderRadius: 9999, flexShrink: 0, ...dotStyle } }, 'dot')
         : jsx(Codicon, { name: codicon, size: '0.85rem', 'aria-hidden': true, style: { color: 'var(--ui-text-tertiary)', flexShrink: 0 } }, 'icon'),
-      jsx('span', { style: { flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: label }, 'label'),
+      compact
+        ? null
+        : jsx('span', { style: { flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: label }, 'label'),
       (count > 0 || dim)
         ? jsx('span', { style: { fontVariantNumeric: 'tabular-nums', fontSize: 10, color: 'var(--ui-text-tertiary)' }, children: String(count) }, 'count')
         : null
     ]
-  }, `rail-${label}`)
+  }, `rail-${railId ?? label}`)
 }
 
 // ── approval card ────────────────────────────────────────────────────────────
@@ -1209,10 +1272,12 @@ function InlineDetail({ ctx, item }) {
       jsx(PanelMeta, {
         rows: [
           { label: 'Title', value: item.title || UNKNOWN },
-          { label: 'Session', value: item.session_key },
+          // Session key + cwd are the unbounded-length values: hand PanelMeta a
+          // wrapping element so the 214px docked column never scrolls sideways.
+          { label: 'Session', value: jsx('span', { style: { overflowWrap: 'anywhere', wordBreak: 'break-all', minWidth: 0 }, children: item.session_key }, 'session-key') },
           { label: 'Lanes', value: lanes.map(lane => LANE_LABEL[lane] ?? lane).join(', ') || UNKNOWN },
           { label: 'Source', value: item.source || UNKNOWN },
-          { label: 'Cwd', value: item.cwd || UNKNOWN },
+          { label: 'Cwd', value: jsx('span', { style: { overflowWrap: 'anywhere', wordBreak: 'break-all', minWidth: 0 }, children: item.cwd || UNKNOWN }, 'cwd') },
           ...((item.subagent_count > 0 || item.subagent_count_unavailable)
             ? [{ label: 'Subagents', value: item.subagent_count_unavailable ? `${item.subagent_count}+ (unavailable)` : String(item.subagent_count) }]
             : []),
@@ -1291,14 +1356,25 @@ function InlineDetail({ ctx, item }) {
 function ActionCenterPage({ ctx }) {
   const qc = useQueryClient()
   const profile = useValue(host.state.profile)
-  const viewport = useValue(host.state.viewport)
-  // Core parity (PanelBody `min-[47.5rem]:flex-row`): master/detail sit
-  // side-by-side once the VIEWPORT reaches 47.5rem (760px at the app's fixed
-  // --dt-base-size) and stack below it, so the detail keeps full width instead
-  // of being squeezed beside the rail. The 640px `narrow` flag (sidebar
-  // collapse) is NOT PanelBody's breakpoint — gating on it left 640–759px
-  // windows with an 11rem rail beside a stacked body.
-  const stackRailAbove = (viewport?.width ?? 1280) < RAIL_STACK_MIN_PX
+  // Posture follows the MEASURED CONTAINER (the docked tab is ~2/3 of the
+  // viewport once the sidebar + paddings are subtracted — live measured
+  // 678/214/88px at 1024/560/400px viewports), not PanelBody's own
+  // viewport-based `min-[47.5rem]` split.
+  const [bodyRef, measuredWidth] = useMeasuredContainer()
+  // PanelBody splits by VIEWPORT media query (min-[47.5rem]) and cannot see
+  // the docked container, so the split direction is owned HERE: a measured
+  // wrapper inside PanelBody renders row only when the measurement reaches
+  // RAIL_STACK_MIN_PX — column (stacked) while unmeasured, under it, or on
+  // viewport-only "wide" states PanelBody's media query would otherwise
+  // misread. The wrapper is 100% wide so the rail + detail share the real
+  // container width.
+  const splitDirection = measuredWidth !== null && measuredWidth >= RAIL_STACK_MIN_PX ? 'row' : 'column'
+  const posture = postureFor(measuredWidth)
+  const stackRailAbove = posture === 'stacked' || posture === null
+  const compactRail = posture === 'compact'
+  const tooNarrow = posture === 'too-narrow'
+  // Compact rail default: collapsed (icon strip); the user can expand it.
+  const [compactRailOpen, setCompactRailOpen] = useState(false)
   const summary = useSummaryQuery(ctx, profile)
 
   const [category, setCategory] = useState('all')
@@ -1372,7 +1448,7 @@ function ActionCenterPage({ ctx }) {
   }
 
   const coverageLine = coverage
-    ? `Profile: ${coverage.profile} · ${coverage.scanned_sessions} sessions scanned${coverage.partial ? ' · partial' : ''}`
+    ? `Profile: ${coverage.profile} · ${coverage.scanned_sessions} sessions scanned${coverage.partial ? ' · partial' : ''}${coverage.expired_requests?.partial ? ' · observed expiry history only' : ''}`
     : 'loading connection…'
   const hasErrors = (coverage?.errors?.length ?? 0) > 0
   const isPartial = coverage?.partial ?? false
@@ -1381,36 +1457,97 @@ function ActionCenterPage({ ctx }) {
 
   const retryButton = jsx(Button, { type: 'button', variant: 'secondary', size: 'xs', onClick: refresh, children: 'Try again' }, 'retry')
 
+  // Too-narrow posture: an honest "this pane is too narrow to use" notice with
+  // an expand affordance — never a silently clipped rail/list at absurd widths.
+  const tooNarrowNotice = jsx('div', {
+    'data-ac-too-narrow': '',
+    role: 'status',
+    style: { padding: 4, minWidth: 0, display: 'grid', gap: 8, justifyItems: 'stretch', overflowWrap: 'anywhere' },
+    children: [
+      jsx('p', { style: { margin: 0, ...textSecondary, fontSize: 12 }, children: 'Too narrow to use. Widen pane.' }, 'msg'),
+      jsx(Button, {
+        type: 'button',
+        variant: 'secondary',
+        size: 'xs',
+        'aria-label': 'expand Action Center to a wider surface',
+        'data-ac-expand': '',
+        children: 'Expand',
+        style: { minWidth: 0, width: '100%', padding: '4px', whiteSpace: 'normal' },
+        onClick: () => {
+          haptic('tap')
+          if (typeof host?.openWorkspace === 'function') {
+            host.openWorkspace('action-center', {
+              title: 'Action Center',
+              minWidth: OPEN_MIN_WIDTH_PX,
+              render: () => jsx(ActionCenterPage, { ctx })
+            })
+          } else if (typeof host?.navigate === 'function') {
+            host.navigate(PAGE_ROUTE)
+          }
+        }
+      }, 'expand')
+    ]
+  }, 'too-narrow')
+
+  const railRows = [
+    jsx(RailRow, {
+      label: 'Needs attention',
+      railId: 'needs-attention',
+      count: needsAttentionCount,
+      dotStyle: needsAttentionCount > 0 ? { background: 'var(--ui-red)' } : { background: 'var(--ui-text-quaternary)' },
+      active: needsAttentionOnly && narrowBySection,
+      dim: isSearching && needsAttentionCount === 0,
+      compact: compactRail,
+      onClick: handleNeedsAttentionClick
+    }, 'needs-attention'),
+    compactRail
+      ? null
+      : jsx('div', { style: { height: 1, background: 'var(--ui-stroke-tertiary)', margin: '4px 2px' } }, 'sep'),
+    ...navItems.map(cat => jsx(RailRow, {
+      label: cat.label,
+      railId: cat.id,
+      codicon: cat.icon,
+      count: navCounts[cat.id] ?? 0,
+      active: narrowBySection ? (category === cat.id && !needsAttentionOnly) : cat.id === 'all',
+      dim: isSearching && (navCounts[cat.id] ?? 0) === 0,
+      compact: compactRail,
+      onClick: () => handleCategoryClick(cat.id)
+    }, cat.id))
+  ]
+
   const rail = jsxs('div', {
+    'data-ac-rail-panel': '',
+    role: compactRail ? undefined : 'group',
+    'aria-label': compactRail ? undefined : 'Session sections',
     style: {
-      width: stackRailAbove ? '100%' : '11rem',
+      width: compactRail ? 'auto' : stackRailAbove ? '100%' : '11rem',
       flexShrink: 0,
+      minWidth: 0,
       display: 'flex',
-      flexDirection: 'column',
+      flexDirection: compactRail ? 'row' : 'column',
+      alignItems: compactRail ? 'center' : undefined,
       gap: 2,
+      flexWrap: compactRail ? 'wrap' : undefined,
       // Stacked posture: the rail becomes a horizontal strip pinned to the top,
       // so the list below keeps the vertical space for rows.
       ...(stackRailAbove ? { maxHeight: '40%', overflowY: 'auto' } : {})
     },
     children: [
-    jsx(RailRow, {
-      label: 'Needs attention',
-      count: needsAttentionCount,
-      dotStyle: needsAttentionCount > 0 ? { background: 'var(--ui-red)' } : { background: 'var(--ui-text-quaternary)' },
-      active: needsAttentionOnly && narrowBySection,
-      dim: isSearching && needsAttentionCount === 0,
-      onClick: handleNeedsAttentionClick
-    }, 'needs-attention'),
-    jsx('div', { style: { height: 1, background: 'var(--ui-stroke-tertiary)', margin: '4px 2px' } }, 'sep'),
-    ...navItems.map(cat => jsx(RailRow, {
-      label: cat.label,
-      codicon: cat.icon,
-      count: navCounts[cat.id] ?? 0,
-      active: narrowBySection ? (category === cat.id && !needsAttentionOnly) : cat.id === 'all',
-      dim: isSearching && (navCounts[cat.id] ?? 0) === 0,
-      onClick: () => handleCategoryClick(cat.id)
-    }, cat.id))
-  ] }, 'rail')
+      compactRail
+        ? jsx(Button, {
+            type: 'button',
+            variant: 'ghost',
+            size: 'micro',
+            'aria-expanded': Boolean(compactRailOpen),
+            'aria-label': 'Show section filters',
+            'data-ac-rail-toggle': '',
+            onClick: () => setCompactRailOpen(o => !o),
+            children: jsx(Codicon, { name: compactRailOpen ? 'chevron-right' : 'list-flat', size: '0.85rem', 'aria-hidden': true }, 'icon')
+          }, 'rail-toggle')
+        : null,
+      ...((compactRail && !compactRailOpen) ? [] : railRows)
+    ]
+  }, 'rail')
 
   const rowFor = item => jsxs('div', { style: { display: 'flex', flexDirection: 'column' }, children: [
     jsx(PanelListRow, {
@@ -1471,9 +1608,23 @@ function ActionCenterPage({ ctx }) {
 
   return jsxs('div', {
     'data-action-center': 'page',
+    // The measured container: the docked tab's own content box (678/214/88px at
+    // 1024/560/400px viewports live) — NOT window.innerWidth.
+    ref: bodyRef,
+    'data-ac-body': '',
     style: { height: '100%', minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', color: textPrimary.color, fontSize: 12 },
     children: [
-      jsx(PanelHeader, {
+      tooNarrow ? null : compactRail ? jsxs('div', {
+        'data-ac-compact-header': '',
+        style: { padding: '4px 0 8px', minWidth: 0, display: 'grid', gap: 4 },
+        children: [
+          jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 6 }, children: [
+            jsx(PanelSectionLabel, { children: 'Action Center' }, 'title'),
+            jsx(Button, { type: 'button', variant: 'text', size: 'xs', onClick: refresh, 'aria-label': 'Refresh Action Center', children: jsx(icons.RefreshCw, { 'aria-hidden': true, style: { width: 12, height: 12 } }) }, 'refresh')
+          ] }, 'top'),
+          jsx('p', { style: { margin: 0, fontSize: 10, overflowWrap: 'anywhere', ...textTertiary }, children: coverageLine }, 'scope')
+        ]
+      }, 'compact-header') : jsx(PanelHeader, {
         title: 'Action Center',
         subtitle: coverageLine,
         actions: jsx(Button, {
@@ -1486,19 +1637,34 @@ function ActionCenterPage({ ctx }) {
           children: jsx(icons.RefreshCw, { 'aria-hidden': true, style: { width: 12, height: 12 } }, 'icon')
         }, 'refresh')
       }, 'header'),
-      jsx(PanelBody, { children: [
-        rail,
-        jsxs('div', { style: { display: 'flex', minWidth: 0, flex: 1, flexDirection: 'column', gap: stackRailAbove ? 8 : 4 }, children: [
-          jsx(SearchField, {
-            'aria-label': 'Search sessions',
-            placeholder: 'Search title, key, or path…',
-            value: query,
-            onChange: handleQueryChange,
-            containerClassName: 'w-full'
-          }, 'search'),
-          jsx('div', { style: { display: 'flex', minHeight: 0, flex: 1, flexDirection: 'column', overflowY: 'auto', overflowX: 'hidden' }, children: listBody }, 'rows')
-        ] }, 'right')
-      ] }, 'body')
+      // PanelBody's own min-[47.5rem] media query reads the VIEWPORT and cannot
+      // see this docked container, so the measured split lives in THIS wrapper:
+      // row only when the measurement reaches RAIL_STACK_MIN_PX (and PanelBody's
+      // media-query row, when it fires, just re-applies the same row direction
+      // to a wrapper that is already row). Stacked/compact/too-narrow stay
+      // column regardless of how wide the viewport is.
+      jsx(PanelBody, {
+        className: 'w-full',
+        children: jsx('div', {
+          'data-ac-split': '',
+          style: { display: 'flex', width: '100%', minWidth: 0, flex: 1, minHeight: 0, flexDirection: splitDirection, gap: stackRailAbove ? 8 : 20 },
+          children: tooNarrow
+            ? [tooNarrowNotice]
+            : [
+                rail,
+                jsxs('div', { style: { display: 'flex', minWidth: 0, flex: 1, flexDirection: 'column', gap: stackRailAbove ? 8 : 4 }, children: [
+                  jsx(SearchField, {
+                    'aria-label': 'Search sessions',
+                    placeholder: 'Search title, key, or path…',
+                    value: query,
+                    onChange: handleQueryChange,
+                    containerClassName: 'w-full'
+                  }, 'search'),
+                  jsx('div', { style: { display: 'flex', minHeight: 0, flex: 1, flexDirection: 'column', overflowY: 'auto', overflowX: 'hidden' }, children: listBody }, 'rows')
+                ] }, 'right')
+              ]
+        }, 'split')
+      }, 'body')
     ]
   }, 'page')
 }
@@ -1545,6 +1711,23 @@ function ActionCenterChip({ ctx }) {
     ]
   }, 'chip')
 }
+
+// ── responsive contract (exported for smoke + live tests) ────────────────────
+
+/** The measured-container contract every UI band answers to. Bands:
+ *  too-narrow (<RAIL_MIN_PX): honest notice + expand affordance;
+ *  compact (≤RAIL_COMPACT_MAX_PX): collapsible icon rail, full-width detail;
+ *  stacked (<RAIL_STACK_MIN_PX): rail above the list;
+ *  wide (≥RAIL_STACK_MIN_PX): 11rem side rail; the measured split wrapper
+ *  (data-ac-split) owns the body direction so PanelBody's viewport media
+ *  query cannot fight the measured container. */
+export const acResponsive = Object.freeze({
+  RAIL_STACK_MIN_PX,
+  RAIL_COMPACT_MAX_PX,
+  RAIL_MIN_PX,
+  OPEN_MIN_WIDTH_PX,
+  postureFor
+})
 
 // ── plugin registration ──────────────────────────────────────────────────────
 

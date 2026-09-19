@@ -1,5 +1,7 @@
 # Action Center review and repair report
 
+Historical first-pass report. The current release verdict and final verification are in [RELEASE.md](RELEASE.md); the open gates below were addressed in the subsequent release pass.
+
 ## Verdict
 
 **Reviewed and materially hardened; automated suites pass. Not full product acceptance.** The remaining release limitations are automatic expired-request capture on an unpatched gateway, narrow/docked layout clipping, and the absence of a live end-to-end pending-request interaction run. Nothing was pushed.
