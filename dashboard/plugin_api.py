@@ -30,9 +30,11 @@ Routes (all JSON):
   GET  /details?session_key=&profile=   scoped request details (core
                                   ``inbox.requests`` result)
   POST /respond {request_id, choice, session_key, profile}   approve/deny
-  POST /answer  {request_id, answer[, question_id], profile} clarify answer
-                                  (string or JSON array; batch = one call per
-                                  question, proxied through ``clarify.lock``)
+  POST /answer  {request_id, answer, session_key[, question_id], profile}
+                                  clarify answer (string or JSON array;
+                                  batch = one call per question, proxied
+                                  through ``clarify.lock``; the request id
+                                  must be owned by the addressed session)
   POST /control {action, session_key[, live_session_id], profile}   pause/resume
                                   for goal|loop|heartbeat — live runtime when
                                   one is attached, persisted state otherwise
@@ -59,6 +61,7 @@ gateway behavior at import time.
 from __future__ import annotations
 
 import contextlib
+import functools
 import inspect
 import json
 import logging
@@ -166,9 +169,35 @@ def _denied_source(row) -> bool:
     return (row.get("source") or "").strip().lower() in _deny_sources()
 
 
+def _denied_live_record(record) -> bool:
+    """A live runtime record whose source is deny-listed is not human-facing (same
+    deny-list the session sidebar applies to the durable rows)."""
+    return _denied_source(record)
+
+
 def _safe_error_message(exc: Exception) -> str:
     """Sanitize an exception for egress: safe code only, never raw internal text."""
     return f"{type(exc).__name__}"
+
+
+def _route_guard(message: str):
+    """The core's outer handler discipline for the read routes: an unexpected failure
+    becomes the named error (HTTP 503, the core's own message) — never a bare 500 and
+    never a fabricated partial result. Named HTTP errors pass through untouched."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except HTTPException:
+                raise
+            except Exception as exc:  # noqa: BLE001 - fail closed, never fabricate a partial badge
+                # Log hygiene: exception CLASS only. Raw exc text / tracebacks can carry
+                # credential-shaped values (command lines, tokens, request ids) into logs.
+                log.debug("%s failed: %s", fn.__name__, _safe_error_message(exc))
+                raise _http_error(5031, message) from exc
+        return wrapper
+    return deco
 
 
 def _err_payload(code: int, message: str) -> dict:
@@ -185,6 +214,38 @@ def _raise_from_envelope(response: dict, default_code: int = 5031) -> None:
     if error:
         code = int(error.get("code") or default_code)
         raise _http_error(code, str(error.get("message") or "request failed"))
+
+
+def _offered_choices(data: dict) -> set[str]:
+    """The choices THIS approval actually offers (the core's own computation)."""
+    try:
+        return {str(c) for c in (_server()._approval_request_payload(data or {}).get("choices") or [])}
+    except Exception:  # noqa: BLE001 - a queue read failure must not widen the gate
+        return {"deny"}
+
+
+def _validate_choice_offered(session_key: str, request_id: str, choice: str) -> None:
+    """Refuse a choice the pending approval never offered.
+
+    The approval payload's own ``choices`` are the authority (mirrors the core's
+    ``_approval_request_payload``: smart-denied approvals drop ``session``/``always``,
+    ``allow_permanent=False`` drops ``always``). ``resolve_gateway_approval`` itself
+    accepts any string, so without this gate an Action Center ``always`` could grant a
+    permanent rule for an approval that only offered once/deny.
+    """
+    try:
+        from tools import approval as _approval
+
+        pending = {str(p.get("request_id") or ""): p for p in _approval.list_gateway_approvals(session_key)}
+    except Exception as exc:  # noqa: BLE001 - fail closed: never resolve on an unreadable queue
+        raise _http_error(5031, f"approval resolve failed: {_safe_error_message(exc)}") from exc
+    payload = pending.get(request_id)
+    if payload is None:
+        return  # nothing pending by that id: the resolve below reports it honestly
+    offered = _offered_choices(payload)
+    if choice not in offered:
+        raise _http_error(
+            4004, f"choice '{choice}' is not offered by this request (offered: {', '.join(sorted(offered))})")
 
 
 def _storage_unavailable() -> HTTPException:
@@ -259,23 +320,114 @@ def _listing_rows(db, limit: int) -> list:
     return [row for row in rows if not _denied_source(row)]
 
 
-def _live_session_for_key(profile_home, session_key: str) -> str | None:
-    """Runtime id of the live session owning *session_key* in this profile, else None."""
+def _live_sids_for_key(profile_home, session_key: str) -> list[str]:
+    """Runtime ids of every live, human-facing session owning *session_key* in this profile."""
     server = _server()
     want_home = _inbox_home_key(profile_home)
     try:
         with server._sessions_lock:
             snapshot = list(server._sessions.items())
     except Exception:  # noqa: BLE001
-        return None
+        return []
+    out: list[str] = []
     for sid, record in snapshot:
         if not isinstance(record, dict) or record.get("_finalized"):
             continue
         if _inbox_home_key(record.get("profile_home")) != want_home:
             continue
-        if str(record.get("session_key") or "") == session_key:
-            return sid
+        if str(record.get("session_key") or "") != session_key:
+            continue
+        if _denied_live_record(record):
+            continue
+        out.append(sid)
+    return out
+
+
+def _live_session_for_key(profile_home, session_key: str) -> str | None:
+    """Runtime id of the live, human-facing session owning *session_key* in this profile, else None."""
+    for sid in _live_sids_for_key(profile_home, session_key):
+        return sid
     return None
+
+
+def _owned_request_ids(server, live_sids: list[str]) -> set[str]:
+    """Server→client request ids the listed live sessions PROVABLY own.
+
+    Read through the gateway's own aggregate reader (``server._open_requests``):
+    the local queue for the session's runtime id, plus the compute-host mirror
+    the parent keeps for host-owned requests. Nothing outside this session in
+    this profile is ever in the set, so an answer can only bind to a request the
+    addressed session actually owns — never a globally-resolved foreign id.
+    """
+    owned: set[str] = set()
+    for sid in live_sids:
+        try:
+            snaps = server._open_requests(sid)
+        except Exception as exc:  # noqa: BLE001 - failed ownership lookup is not expiry
+            raise _http_error(5031, f"request ownership read failed: {_safe_error_message(exc)}") from exc
+        for snap in snaps:
+            if isinstance(snap, dict) and snap.get("method") == "clarify" and snap.get("id"):
+                owned.add(str(snap["id"]))
+    return owned
+
+
+def _require_session_row(server, session_key: str, profile: str | None) -> dict:
+    """The durable session row must exist in the addressed profile and be human-facing.
+
+    The trust anchor for every mutation: a session the Action Center would never
+    list (unlisted row, deny-listed source) can never be acted on — fail closed
+    with the core's ``session not found`` refusal.
+    """
+    with server._profile_db({"profile": (profile or "").strip() or None}) as db:
+        if db is None:
+            raise _storage_unavailable()
+        return _session_row_from(db, session_key)
+
+
+def _session_row_from(db, session_key: str) -> dict:
+    """``_require_session_row`` against an ALREADY-OPEN handle (redo/dismiss share
+    one writable handle for lookup + clear; the gate must not open a second one)."""
+    row = db.get_session(session_key) if db is not None else None
+    if row is None or _denied_source(row):
+        raise _http_error(4001, "session not found")
+    return row
+
+
+def _live_runtime_binding(live_session_id: str, profile_home, session_key: str,
+                          profile: str | None = None) -> dict | None:
+    """The live runtime record for *live_session_id* when it provably belongs to
+    *session_key* in this profile, else None.
+
+    Binds the client-supplied runtime id to the durable identity before the live
+    dispatch path may use it: a stale/reaped id, an id from another profile, or an id
+    pointing at a DIFFERENT session must never route another session's runtime through
+    the gateway's ``session.control``. Mirrors the core's profile-normalized matching.
+    The session row must ALSO exist and be human-facing (the same gate the direct-state
+    path applies), so the live path can never reach a session the Action Center would
+    never list (deny-listed source, internal automation, unlisted row).
+    """
+    server = _server()
+    try:
+        with server._profile_db({"profile": (profile or "").strip() or None}) as db:
+            row = db.get_session(session_key) if db is not None else None
+    except Exception:  # noqa: BLE001 - fail closed: an unreadable store never widens the gate
+        return None
+    if row is None or _denied_source(row):
+        return None
+    try:
+        with server._sessions_lock:
+            record = server._sessions.get(live_session_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(record, dict) or record.get("_finalized"):
+        return None
+    if _inbox_home_key(record.get("profile_home")) != _inbox_home_key(profile_home):
+        return None
+    if str(record.get("session_key") or "") != session_key:
+        return None
+    if _denied_live_record(record):
+        return None
+    return record
 
 
 def _pending_approval(session_key: str):
@@ -403,13 +555,14 @@ def _live_clarify_by_session_key(profile_home) -> tuple[dict[str, int], list[str
     out: dict[str, int] = {}
     errors: list[str] = []
     try:
+        from tui_gateway import server_requests
+
         with server._sessions_lock:
             snapshot = list(server._sessions.items())
     except Exception as exc:  # noqa: BLE001
-        log.debug("action-center live-session enumeration failed", exc_info=True)
+        log.debug("action-center live-session enumeration failed: %s", _safe_error_message(exc))
         errors.append(f"live-session enumeration failed: {_safe_error_message(exc)}")
         return out, errors
-    from tui_gateway import server_requests
 
     # Both sides normalize through _inbox_home_key: None means the launch profile's home.
     want_home = _inbox_home_key(profile_home)
@@ -438,10 +591,12 @@ def _subagent_counts_by_owner() -> tuple[dict[str, int], str | None]:
     Only the count is surfaced — never the goal text or transcript content.
     Returns ``(counts, error)`` where *error* is None on success or a safe error
     message on failure — never ``{}`` misinterpreted as "zero subagents".
+    The import is inside the guarded block: a gateway without the registry module
+    is a degraded data source (a coverage error), never a 500.
     """
-    from tools.delegate_tool_registry import list_active_subagents
-
     try:
+        from tools.delegate_tool_registry import list_active_subagents
+
         records = list_active_subagents()
     except Exception as exc:  # noqa: BLE001
         return {}, f"subagent enumeration failed: {_safe_error_message(exc)}"
@@ -458,12 +613,14 @@ def _background_task_counts_by_session(session_keys: list[str]) -> tuple[dict[st
 
     Uses ``process_registry.list_sessions(session_key=key)`` for each bounded
     allowed key to respect the PUBLIC scoped API.  Only the count is surfaced —
-    never command text or output content.
+    never command text or output content.  The import is inside the guarded
+    block: a gateway without the registry module is a degraded data source (a
+    coverage error), never a 500.
     """
-    from tools.process_registry import process_registry
-
     counts: dict[str, int] = {}
     try:
+        from tools.process_registry import process_registry
+
         for key in session_keys:
             if not key:
                 continue
@@ -492,6 +649,14 @@ def _parse_expired_record(raw) -> dict | None:
     if not isinstance(entry, dict) or not entry.get("request_id"):
         return None
     return entry
+
+
+def _expired_read_failed(entries) -> bool:
+    """True when a ``load_expired_requests`` result is the named scan failure
+    (``[{"error": ...}]``) rather than clean data. A failed DB scan must never
+    masquerade as "nothing expired"."""
+    return bool(entries) and len(entries) == 1 and isinstance(entries[0], dict) and (
+        "error" in entries[0] and "request_id" not in entries[0])
 
 
 def _delete_meta(db, key: str) -> None:
@@ -533,45 +698,62 @@ def record_expired_request(db, session_key: str, payload: dict, outcome: str) ->
     try:
         db.set_meta(_expired_record_key(session_key, request_id), json.dumps(entry))
         _prune_expired_requests(db, session_key)
-    except Exception:  # noqa: BLE001
-        log.warning("failed to record expired request %s", request_id, exc_info=True)
+    except Exception:  # noqa: BLE001 - request_id is caller-controlled; class-only log
+        log.warning("failed to record expired request")
         return False
     return True
 
 
 def _prune_expired_requests(db, session_key: str) -> None:
-    """Keep the newest N per session and drop anything past the age window."""
+    """Keep the newest N per session and drop anything past the age window.
+
+    A failed read classifies nothing: pruning is skipped (records may
+    over-retain, but a failed scan never drives deletes).
+    """
+    entries = load_expired_requests(db, session_key)
+    if _expired_read_failed(entries):
+        return
     cutoff = time.time() - _EXPIRED_MAX_AGE_S
-    for index, entry in enumerate(load_expired_requests(db, session_key)):  # newest first
+    for index, entry in enumerate(entries):  # newest first
         too_old = float(entry.get("ended_at") or 0) < cutoff
         if too_old or index >= _EXPIRED_KEEP_PER_SESSION:
             _delete_meta(db, _expired_record_key(session_key, str(entry.get("request_id") or "")))
 
 
 def load_expired_requests(db, session_key: str) -> list[dict]:
-    """Expired requests for one session, newest first."""
+    """Expired requests for one session, newest first.
+
+    A failed prefix scan returns the named failure ``[{"error": <class>}]`` — never
+    ``[]``, which callers would read as "nothing expired" (a false all-clear). A
+    clean read with genuinely no rows still returns ``[]``.
+    """
     if db is None or not session_key:
         return []
     try:
         rows = db.list_meta_prefix(f"{_EXPIRED_PREFIX}{session_key}.")
-    except Exception:  # noqa: BLE001
-        log.debug("expired-request read failed", exc_info=True)
-        return []
+    except Exception as exc:  # noqa: BLE001
+        log.debug("expired-request read failed: %s", _safe_error_message(exc))
+        return [{"error": _safe_error_message(exc)}]
     entries = [entry for _key, raw in rows if (entry := _parse_expired_record(raw)) is not None]
     entries.sort(key=lambda e: float(e.get("ended_at") or 0), reverse=True)
     return entries
 
 
-def load_expired_request_counts(db) -> dict[str, int]:
-    """session_key → expired-request count for every session, from ONE prefix scan."""
+def load_expired_request_counts(db) -> tuple[dict[str, int], str | None]:
+    """session_key → expired-request count for every session, from ONE prefix scan.
+
+    Returns ``(counts, error)``: *error* is None on a clean scan (including a
+    valid empty store → ``{}``), or the exception class name when the scan
+    failed — so callers can surface partial coverage instead of an all-clear.
+    """
     counts: dict[str, int] = {}
     if db is None:
-        return counts
+        return counts, None
     try:
         rows = db.list_meta_prefix(_EXPIRED_PREFIX)
-    except Exception:  # noqa: BLE001
-        log.debug("expired-request scan failed", exc_info=True)
-        return counts
+    except Exception as exc:  # noqa: BLE001
+        log.debug("expired-request scan failed: %s", _safe_error_message(exc))
+        return counts, _safe_error_message(exc)
     for _key, raw in rows:
         entry = _parse_expired_record(raw)
         if entry is None:
@@ -579,7 +761,7 @@ def load_expired_request_counts(db) -> dict[str, int]:
         key = str(entry.get("session_key") or "")
         if key:
             counts[key] = counts.get(key, 0) + 1
-    return counts
+    return counts, None
 
 
 def clear_expired_request(db, session_key: str, request_id: str) -> bool:
@@ -723,6 +905,8 @@ def _gather_requests_for_session(
 
     # Gather clarifications from server_requests.
     try:
+        from tui_gateway import server_requests
+
         snapshots = server_requests.open_requests(sid)
         for snap in snapshots:
             method_name = snap.get("method", "")
@@ -857,8 +1041,8 @@ def _direct_state_control(session_key: str, action: str, profile: str | None) ->
     try:
         control = server._snapshot_control(session_key)
     except Exception as exc:  # noqa: BLE001
-        log.debug("session.control snapshot after direct %s failed: %s", action, exc, exc_info=True)
-        raise _http_error(5031, f"session.control snapshot failed: {exc}") from exc
+        log.debug("session.control snapshot after direct %s failed: %s", action, _safe_error_message(exc))
+        raise _http_error(5031, f"session.control snapshot failed: {_safe_error_message(exc)}") from exc
 
     # A runtime for this key may exist after all (the client's live id was stale): refresh it
     # so any open chat surface follows the change the same way the live path keeps it in sync.
@@ -869,7 +1053,7 @@ def _direct_state_control(session_key: str, action: str, profile: str | None) ->
             event_control = {key: value for key, value in control.items() if key != "loop_min_interval_seconds"}
             server._emit("session.control.update", live_sid, {"control": event_control})
     except Exception as exc:  # noqa: BLE001
-        log.debug("session.control.update emit after direct %s failed (best-effort): %s", action, exc, exc_info=True)
+        log.debug("session.control.update emit after direct %s failed (best-effort): %s", action, _safe_error_message(exc))
 
     return {"control": control, "dispatch": _dispatch_envelope(action_result)}
 
@@ -934,6 +1118,7 @@ class DismissBody(BaseModel):
 
 # ── routes ────────────────────────────────────────────────────────────────────
 @router.get("/summary")
+@_route_guard("inbox.list failed")
 def action_center_summary(profile: str = "", limit: int = _DEFAULT_LIMIT) -> dict:
     """Read-only cross-session aggregation for the active profile.
 
@@ -962,14 +1147,14 @@ def action_center_summary(profile: str = "", limit: int = _DEFAULT_LIMIT) -> dic
             try:
                 rows = _listing_rows(db, fetch_limit)
             except Exception as exc:  # noqa: BLE001
-                log.warning("action-center summary scan failed: %s", exc)
+                log.warning("action-center summary scan failed: %s", _safe_error_message(exc))
                 raise _http_error(5031, "inbox.list scan failed") from exc
             # One prefix scan for every session's expired-request count (state_meta), so a
             # request that died without an answer stays visible after its turn, session
             # close and app restart.  Read on the SAME open handle — the core read it
             # after the with-block, which silently no-ops on a closed foreign-profile
             # handle; here the handle is still open, foreign profiles included.
-            expired_by_key = load_expired_request_counts(db)
+            expired_by_key, expired_scan_error = load_expired_request_counts(db)
 
         clarify_by_key, clarify_errors = _live_clarify_by_session_key(profile_home)
         subagent_by_key, subagent_error = _subagent_counts_by_owner()
@@ -986,6 +1171,10 @@ def action_center_summary(profile: str = "", limit: int = _DEFAULT_LIMIT) -> dic
 
         items: list[dict] = []
         errors: list[str] = []
+        if expired_scan_error is not None:
+            # A failed store-wide scan is NOT a valid empty store: declare partial
+            # coverage (red badge) instead of an all-clear.
+            errors.append(f"expired-request scan failed: {expired_scan_error}")
         if subagent_error:
             errors.append(subagent_error)
         if bg_task_error:
@@ -1053,10 +1242,10 @@ def action_center_summary(profile: str = "", limit: int = _DEFAULT_LIMIT) -> dic
                 "background_task_count_unavailable": bg_task_error is not None,
             })
 
-        # Honest truncation: we fetched cap+1 rows; if we got more than cap raw rows
-        # (before deny filtering), the result is truncated regardless of how many
-        # survived filtering.  scanned_sessions is capped at cap to honestly reflect
-        # how many were fully processed.
+        # Honest truncation: we fetched cap+1 rows; if MORE than cap rows survived
+        # deny-list filtering, the listing has more human-facing rows than the page
+        # shows. (Parity with the core: denied-source rows in the DB never count toward
+        # truncation — _listing_rows filters at Python level before this comparison.)
         raw_truncated = len(rows) > cap
         errors.extend(clarify_errors)
         coverage = {
@@ -1078,6 +1267,7 @@ def action_center_summary(profile: str = "", limit: int = _DEFAULT_LIMIT) -> dic
 
 
 @router.get("/details")
+@_route_guard("inbox.requests failed")
 def action_center_details(session_key: str = "", profile: str = "") -> dict:
     """Scoped request details for one session (the core ``inbox.requests`` result).
 
@@ -1105,8 +1295,16 @@ def action_center_details(session_key: str = "", profile: str = "") -> dict:
             context = _build_context_excerpt(db, key)
             # Expired requests survive the turn, the session close and an app restart;
             # they are read here so the panel can still say what died unanswered — and
-            # offer a Redo.
+            # offer a Redo. A FAILED read is not a valid empty store: the record of what
+            # died unanswered becomes unknown, so name it in coverage (red badge).
             expired_requests = load_expired_requests(db, key)
+            pre_errors: list[str] = []
+            if _expired_read_failed(expired_requests):
+                # A failed read is not a valid empty store: the record of what died
+                # unanswered becomes unknown — name it in coverage (red badge), and
+                # never render the failure sentinel as a record row.
+                pre_errors.append(f"expired-request read failed: {expired_requests[0]['error']}")
+                expired_requests = []
 
         # Thread-safe snapshot of live sessions
         try:
@@ -1134,7 +1332,7 @@ def action_center_details(session_key: str = "", profile: str = "") -> dict:
 
         all_approvals: list[dict] = []
         all_clarifications: list[dict] = []
-        all_errors: list[str] = []
+        all_errors: list[str] = list(pre_errors)
         live_ids: list[str] = []
         for sid, record in live_sessions:
             live_ids.append(sid)
@@ -1180,10 +1378,10 @@ def action_center_respond(body: RespondBody) -> dict:
     """Approve/deny one pending approval (choice ∈ once|session|always|deny).
 
     Mirrors the core's ``approval.respond`` for a specific ``request_id``, resolved
-    by durable session identity: the session must be live in this profile (an
-    approval prompt belongs to a live session's queue; nothing is resolved
-    remotely otherwise).  Reading the queue never consumes it — only the
-    operator's choice does.
+    by durable session identity: the session must have a human-facing row in this
+    profile AND be live here (an approval prompt belongs to a live session's
+    queue; nothing is resolved remotely otherwise).  Reading the queue never
+    consumes it — only the operator's choice does.
     """
     request_id = (body.request_id or "").strip()
     session_key = (body.session_key or "").strip()
@@ -1193,8 +1391,13 @@ def action_center_respond(body: RespondBody) -> dict:
     if choice not in _ALLOWED_CHOICES:
         raise _http_error(4004, "choice must be one of once, session, always, deny")
     with _profile_scope(body.profile) as profile_home:
+        server = _server()
+        # Trust boundary: the durable row must exist and be human-facing (a
+        # deny-listed/unlisted session can never be approved from the panel).
+        _require_session_row(server, session_key, body.profile)
         if _live_session_for_key(profile_home, session_key) is None:
             raise _http_error(4001, "session not found")
+        _validate_choice_offered(session_key, request_id, choice)
         try:
             from tools import approval as _approval
 
@@ -1214,12 +1417,34 @@ def action_center_answer(body: AnswerBody) -> dict:
     through the compute-host bridge first (exactly the core's ``clarify.lock``),
     then locks into the local queue; the LAST lock resolves the request.  A
     non-string answer is JSON-encoded for the lock, as the core does.
+
+    Trust boundary: ``session_key`` is REQUIRED.  The durable row must exist and
+    be human-facing in this profile, the session must be live here, and the
+    request id must belong to one of THIS session's live runtimes (local queue or
+    compute-host mirror) — a known foreign/global id is never resolved.
     """
     request_id = (body.request_id or "").strip()
+    session_key = (body.session_key or "").strip()
     if not request_id:
         raise _http_error(4002, "request_id is required")
-    with _profile_scope(body.profile):
+    if not session_key:
+        raise _http_error(4002, "session_key is required")
+    with _profile_scope(body.profile) as profile_home:
         server = _server()
+        # The addressed session must exist and be human-facing in THIS profile.
+        _require_session_row(server, session_key, body.profile)
+        live_sids = _live_sids_for_key(profile_home, session_key)
+        if not live_sids:
+            raise _http_error(4001, "session not found")
+        # The request id must be PROVABLY owned by one of this session's live
+        # runtimes: the local queue via the same aggregate reader the details
+        # route reads, plus the compute-host mirror for host-owned requests.
+        owned = _owned_request_ids(server, live_sids)
+        if request_id not in owned:
+            # Not provably owned by an addressed session: never resolve globally —
+            # the same honest ``expired`` an unknown id gets, no cross-session leak.
+            return {"status": "expired"}
+
         from tui_gateway import server_requests
 
         if (body.question_id or "").strip():
@@ -1241,6 +1466,9 @@ def action_center_answer(body: AnswerBody) -> dict:
         frame = {"jsonrpc": "2.0", "id": request_id, "result": {"answer": body.answer}}
         if server_requests.resolve_response(frame) or server._relay_compute_host_response(frame):
             return {"status": "ok"}
+        # The ownership pre-check bound this id to an owned session; reaching here
+        # means the request settled between the two reads (genuine race): report
+        # ``expired`` honestly instead of hunting a global winner.
         return {"status": "expired"}
 
 
@@ -1266,12 +1494,19 @@ def action_center_control(body: ControlBody) -> dict:
     if not session_key:
         raise _http_error(4002, "session_key is required")
 
-    server = _server()
     with _profile_scope(body.profile) as profile_home:
-        # Live runtime first, exactly like the core's session.control order.
+        # Every mutation anchors on a human-facing durable row in the addressed
+        # profile — an unlisted/deny-listed session is 404 before any dispatch.
+        server = _server()
+        _require_session_row(server, session_key, body.profile)
+        # Live runtime first, exactly like the core's session.control order. The id the
+        # client sent must actually be THIS session in THIS profile: dispatching through
+        # the gateway's own session.control on an unverified id would let a stale or
+        # foreign live id drive another session's runtime. A verified binding keeps the
+        # live path; anything else falls back to the gated direct-state path.
         if body.live_session_id:
-            session, _err = server._sess_nowait({"session_id": body.live_session_id}, _RID)
-            if session is not None:
+            bound = _live_runtime_binding(body.live_session_id, profile_home, session_key, body.profile)
+            if bound is not None:
                 return _dispatch_live_control(body, raw_action)
         return _direct_state_control(session_key, raw_action, body.profile)
 
@@ -1293,44 +1528,64 @@ def action_center_redo(body: RedoBody) -> dict:
         raise _http_error(4002, "session_key and request_id are required")
     with _profile_scope(body.profile) as profile_home:
         server = _server()
-        with server._profile_db({"profile": (body.profile or "").strip() or None}) as db:
-            if db is None:
-                raise _storage_unavailable()
-            record = next(
-                (entry for entry in load_expired_requests(db, session_key)
-                 if str(entry.get("request_id")) == request_id),
-                None,
-            )
-        if record is None:
-            raise _http_error(4001, "expired request not found")
+        try:
+            # ONE open, WRITABLE handle for the trust gate, the record lookup and
+            # the later clear.
+            # ``writer=True`` is the core's own cross-profile write seam: the default
+            # opens a foreign profile READ-ONLY, so the clear after an accepted submit
+            # would always raise (and after a refused submit a second handle would be
+            # pure waste). writer is a no-op for the launch profile (shared handle).
+            with server._profile_db({"profile": (body.profile or "").strip() or None}, writer=True) as db:
+                if db is None:
+                    raise _storage_unavailable()
+                # Trust boundary: the durable row must exist and be human-facing —
+                # an unlisted/deny-listed session's records are invisible to mutations.
+                _session_row_from(db, session_key)
+                entries = load_expired_requests(db, session_key)
+                if _expired_read_failed(entries):
+                    raise _http_error(
+                        5031, f"expired-request read failed: {entries[0]['error']}")
+                record = next(
+                    (entry for entry in entries
+                     if str(entry.get("request_id")) == request_id),
+                    None,
+                )
+                if record is None:
+                    raise _http_error(4001, "expired request not found")
 
-        live_sid = _live_session_for_key(profile_home, session_key)
-        if live_sid is None:
-            raise _http_error(4009, "session is not running — open it to redo this request")
+                live_sid = _live_session_for_key(profile_home, session_key)
+                if live_sid is None:
+                    raise _http_error(4009, "session is not running — open it to redo this request")
 
-        text = _REDO_PROMPT.format(command=str(record.get("command") or "(command not recorded)"))
-        # Through the composer's own choke point: role alternation, persistence and
-        # streaming behave exactly as a typed message.  ``queued`` never interrupts a
-        # turn in flight, and ``hidden`` keeps a message the user did not type out of
-        # the transcript's bubbles.
-        submit = server._methods.get("prompt.submit")
-        if submit is None:
-            raise _http_error(5031, "prompt.submit unavailable")
-        submitted = submit(_RID, {
-            "session_id": live_sid, "text": text, "queued": True, "display_kind": "hidden",
-        })
-        _raise_from_envelope(submitted)
+                text = _REDO_PROMPT.format(command=str(record.get("command") or "(command not recorded)"))
+                # Through the composer's own choke point: role alternation, persistence and
+                # streaming behave exactly as a typed message.  ``queued`` never interrupts a
+                # turn in flight, and ``hidden`` keeps a message the user did not type out of
+                # the transcript's bubbles.
+                submit = server._methods.get("prompt.submit")
+                if submit is None:
+                    raise _http_error(5031, "prompt.submit unavailable")
+                submitted = submit(_RID, {
+                    "session_id": live_sid, "text": text, "queued": True, "display_kind": "hidden",
+                })
+                _raise_from_envelope(submitted)
 
-        cleared = False
-        with server._profile_db({"profile": (body.profile or "").strip() or None}) as db:
-            if db is not None:
                 cleared = clear_expired_request(db, session_key, request_id)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a storage failure is 503, never a bare 500
+            raise _http_error(5031, f"inbox.redo failed: {_safe_error_message(exc)}") from exc
         return {"redone": True, "session_id": live_sid, "record_cleared": cleared}
 
 
 @router.post("/dismiss")
 def action_center_dismiss(body: DismissBody) -> dict:
-    """Drop one expired-request record (the operator's decision that it is done)."""
+    """Drop one expired-request record (the operator's decision that it is done).
+
+    Trust boundary: the session row must exist and be human-facing in the
+    addressed profile — records of sessions the Action Center would never list
+    cannot be cleared through this route (fail closed: ``session not found``).
+    """
     session_key = (body.session_key or "").strip()
     request_id = (body.request_id or "").strip()
     if not session_key or not request_id:
@@ -1338,9 +1593,15 @@ def action_center_dismiss(body: DismissBody) -> dict:
     with _profile_scope(body.profile):
         server = _server()
         try:
-            with server._profile_db({"profile": (body.profile or "").strip() or None}) as db:
+            # ``writer=True``: Dismiss WRITES (a delete), so a named profile's store must
+            # be opened through the core's cross-profile write seam — the default opens a
+            # foreign profile READ-ONLY and the delete would always fail.
+            with server._profile_db({"profile": (body.profile or "").strip() or None}, writer=True) as db:
                 if db is None:
                     raise _storage_unavailable()
+                # Trust boundary: an unlisted/deny-listed session's records are
+                # invisible to mutations (same gate as /respond /answer /control).
+                _session_row_from(db, session_key)
                 dismissed = clear_expired_request(db, session_key, request_id)
         except HTTPException:
             raise

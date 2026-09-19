@@ -39,6 +39,7 @@ import {
   haptic,
   host,
   icons,
+  Input,
   queryClient,
   relativeTime,
   useQuery,
@@ -54,6 +55,11 @@ const PAGE_ROUTE = '/action-center'
 const QUERY_ROOT = ['action-center']
 const SUMMARY_KEY = ['action-center', 'summary']
 const DETAILS_KEY = ['action-center', 'details']
+// Parity with the real PanelBody (apps/desktop/src/app/overlays/panel.tsx):
+// `min-[47.5rem]:flex-row` stacks master/detail below 47.5rem of VIEWPORT
+// width — 760px at the app's fixed --dt-base-size: 1rem — not at the 640px
+// sidebar-collapse `narrow` flag.
+const RAIL_STACK_MIN_PX = 760
 const REFETCH_MS = 5000
 const UNKNOWN = '—'
 const OTHER_PLACEHOLDER = 'Other (type your answer)'
@@ -310,6 +316,7 @@ function RailRow({ active, codicon, count, dim, dotStyle, label, onClick }) {
   return jsxs('button', {
     type: 'button',
     onClick,
+    'aria-pressed': Boolean(active),
     style: {
       display: 'flex',
       width: '100%',
@@ -366,12 +373,20 @@ function ApprovalCard({ ctx, approval, sessionKey, onResolved }) {
   const [error, setError] = useState(null)
   const [resolved, setResolved] = useState(false)
   const submittingRef = useRef(false)
+  // Pin the profile at mount: the backend resolves the request under the profile
+  // this row was listed by, so a switch mid-flight must not answer under the new
+  // one (the core cards pin the same way and refuse with a named guard).
+  const profileAtMount = useRef(currentProfile())
 
   const choices = availableChoices(approval)
   const hasRequestId = Boolean(approval?.request_id)
 
   const respond = async choice => {
     if (submittingRef.current || resolved || !hasRequestId) return
+    if (currentProfile() !== profileAtMount.current) {
+      setError('Profile changed — re-open to act')
+      return
+    }
     submittingRef.current = true
     setSubmitting(choice)
     setError(null)
@@ -380,11 +395,14 @@ function ApprovalCard({ ctx, approval, sessionKey, onResolved }) {
         request_id: approval.request_id,
         choice,
         session_key: sessionKey,
-        profile: currentProfile()
+        profile: profileAtMount.current
       })
       const resolvedCount = typeof result?.resolved === 'number' ? result.resolved : (result?.ok ? 1 : 0)
       if (resolvedCount > 0) {
         setResolved(true)
+        // Cache maintenance is onResolved's job (InlineDetail.onCardResolved
+        // invalidates the summary AND refetches this row's details) — the card
+        // must not invalidate a second time.
         onResolved?.()
       } else {
         setError('Request may have been resolved already')
@@ -503,6 +521,10 @@ function SingleClarifyCard({ ctx, clarification, sessionKey, onResolved }) {
   const [error, setError] = useState(null)
   const [resolvedState, setResolvedState] = useState(null)
   const submitLock = useRef(false)
+  // Pin the profile at mount (core parity): answering under a different profile
+  // than the one that listed the question would inject the answer into the
+  // wrong backend, so refuse with the named guard instead.
+  const profileAtMount = useRef(currentProfile())
 
   const params = clarification?.params ?? {}
   const choices = Array.isArray(params.choices) ? params.choices : []
@@ -521,6 +543,10 @@ function SingleClarifyCard({ ctx, clarification, sessionKey, onResolved }) {
   const submit = async answer => {
     if (submitting || resolvedState || !answer) return
     if (submitLock.current) return
+    if (currentProfile() !== profileAtMount.current) {
+      setError('Profile changed — re-open to act')
+      return
+    }
     submitLock.current = true
     setSubmitting(true)
     setError(null)
@@ -529,10 +555,12 @@ function SingleClarifyCard({ ctx, clarification, sessionKey, onResolved }) {
         request_id: clarification.request_id,
         answer,
         session_key: sessionKey,
-        profile: currentProfile()
+        profile: profileAtMount.current
       })
       if (result?.status === 'ok') {
         setResolvedState('answered')
+        // Cache maintenance is onResolved's job (InlineDetail.onCardResolved
+        // invalidates the summary AND refetches this row's details).
         onResolved?.()
       } else if (result?.status === 'expired') {
         setResolvedState('expired')
@@ -613,25 +641,29 @@ function SingleClarifyCard({ ctx, clarification, sessionKey, onResolved }) {
                   },
                   children: otherLetter
                 }, 'letter'),
-                jsx('input', {
+                jsx(Input, {
                   value: otherText,
                   placeholder: OTHER_PLACEHOLDER,
+                  size: 'xs',
+                  'aria-label': 'Other — type your answer',
                   onChange: e => {
                     setOtherText(e.target.value)
                     if (e.target.value) setSelectedChoices([])
                   },
-                  style: { minWidth: 0, flex: 1, background: 'transparent', border: 'none', outline: 'none', fontSize: 11, color: textPrimary.color }
+                  style: { minWidth: 0, flex: 1, padding: '2px 6px', fontSize: 10 }
                 }, 'input')
               ]
             }, 'other-row')
           ] }, 'options')
         : null,
       !hasChoices
-        ? jsx('div', { style: { padding: '0 12px 8px' }, children: jsx('input', {
+        ? jsx('div', { style: { padding: '0 12px 8px' }, children: jsx(Input, {
             value: freeText,
             placeholder: 'Type your answer…',
+            size: 'xs',
+            'aria-label': 'Type your answer',
             onChange: e => setFreeText(e.target.value),
-            style: { width: '100%', borderRadius: 4, border: HAIRLINE, background: 'transparent', padding: '4px 8px', fontSize: 11, color: textPrimary.color, outline: 'none' }
+            style: { width: '100%', padding: '4px 8px', fontSize: 10 }
           }, 'input') }, 'free-row')
         : null,
       error ? jsx('div', { style: { padding: '0 12px 4px', ...errColor, fontSize: 10 }, role: 'alert', children: error }, 'error') : null,
@@ -647,7 +679,6 @@ function SingleClarifyCard({ ctx, clarification, sessionKey, onResolved }) {
 }
 
 function BatchClarifyCard({ ctx, clarification, sessionKey, onResolved }) {
-  const qc = useQueryClient()
   const params = clarification?.params ?? {}
   const questions = Array.isArray(params.questions) ? params.questions : []
   const [stagedAnswers, setStagedAnswers] = useState({})
@@ -656,6 +687,9 @@ function BatchClarifyCard({ ctx, clarification, sessionKey, onResolved }) {
   const [error, setError] = useState(null)
   const [resolvedState, setResolvedState] = useState(null)
   const submitLock = useRef(false)
+  // Pin the profile at mount (core parity): a mid-flight profile switch must
+  // not land batch answers under the new backend.
+  const profileAtMount = useRef(currentProfile())
 
   const stagedAnswer = q => {
     const selected = stagedAnswers[q.qid] ?? []
@@ -673,12 +707,24 @@ function BatchClarifyCard({ ctx, clarification, sessionKey, onResolved }) {
   const submit = async () => {
     if (submitting || resolvedState) return
     if (submitLock.current || answeredCount === 0) return
+    if (currentProfile() !== profileAtMount.current) {
+      setError('Profile changed — re-open to act')
+      return
+    }
     submitLock.current = true
     setSubmitting(true)
     setError(null)
     try {
       let lastResult = { status: 'ok' }
       for (const q of questions) {
+        // Fail closed between awaited posts: if the profile flipped mid-batch,
+        // stop answering — the remaining questions must not land on the new
+        // backend under the pinned (now stale) one.
+        if (currentProfile() !== profileAtMount.current) {
+          setError('Profile changed — re-open to act')
+          lastResult = null
+          break
+        }
         const answer = stagedAnswer(q)
         if (answer === null) continue
         lastResult = await postAction(ctx, '/answer', {
@@ -686,12 +732,17 @@ function BatchClarifyCard({ ctx, clarification, sessionKey, onResolved }) {
           question_id: q.qid,
           answer,
           session_key: sessionKey,
-          profile: currentProfile()
+          profile: profileAtMount.current
         })
         if (lastResult?.status === 'expired') break
       }
-      if (lastResult?.status === 'ok') {
+      if (lastResult === null) {
+        // Bailed mid-batch on a profile switch — nothing to commit, keep the
+        // card open with the guard error showing.
+      } else if (lastResult?.status === 'ok') {
         setResolvedState('answered')
+        // Cache maintenance is onResolved's job (InlineDetail.onCardResolved
+        // invalidates the summary AND refetches this row's details).
         onResolved?.()
       } else if (lastResult?.status === 'expired') {
         setResolvedState('expired')
@@ -727,7 +778,7 @@ function BatchClarifyCard({ ctx, clarification, sessionKey, onResolved }) {
         jsx(Codicon, { name: 'list-flat', size: '0.8rem', 'aria-hidden': true }, 'icon'),
         jsx('span', { style: { fontWeight: 500 }, children: `${questions.length} questions` }, 'title')
       ] }, 'title-row') }, 'head'),
-      jsx('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, padding: '0 12px 8px' }, children: questions.map(q => {
+      jsx('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, padding: '0 12px 8px' }, children: questions.map((q, index) => {
         const hasChoices = Array.isArray(q.choices) && q.choices.length > 0
         const isMultiSelect = q.multi_select === true
         const effectiveChoices = Array.isArray(q.choices) ? q.choices : []
@@ -779,26 +830,31 @@ function BatchClarifyCard({ ctx, clarification, sessionKey, onResolved }) {
                   },
                   children: letterFor(effectiveChoices.length)
                 }, 'letter'),
-                jsx('input', {
+                jsx(Input, {
                   value: draft,
                   placeholder: OTHER_PLACEHOLDER,
+                  size: 'xs',
+                  'aria-label': `Other — type your answer for question ${index + 1}`,
                   onChange: e => {
                     const value = e.target.value
                     setStagedDrafts(prev => ({ ...prev, [q.qid]: value }))
                     if (value) setStagedAnswers(prev => ({ ...prev, [q.qid]: [] }))
                   },
-                  style: { minWidth: 0, flex: 1, borderRadius: 4, border: HAIRLINE, background: 'transparent', padding: '2px 6px', fontSize: 10, color: textPrimary.color, outline: 'none' }
+                  style: { minWidth: 0, flex: 1, padding: '2px 6px', fontSize: 10 }
                 }, 'input')
               ] }, 'other-row')
             : null,
           !hasChoices
-            ? jsx('input', {
+            ? jsx(Input, {
                 value: stagedDrafts[q.qid] ?? '',
                 placeholder: 'Answer…',
+                size: 'xs',
+                'aria-label': `Answer for question ${index + 1}`,
                 onChange: e => {
                   const value = e.target.value
                   if (value) {
                     setStagedDrafts(prev => ({ ...prev, [q.qid]: value }))
+                    setStagedAnswers(prev => ({ ...prev, [q.qid]: [] }))
                   } else {
                     setStagedDrafts(prev => {
                       const next = { ...prev }
@@ -807,19 +863,22 @@ function BatchClarifyCard({ ctx, clarification, sessionKey, onResolved }) {
                     })
                   }
                 },
-                style: { width: '100%', borderRadius: 4, border: HAIRLINE, background: 'transparent', padding: '2px 6px', fontSize: 10, color: textPrimary.color, outline: 'none' }
+                style: { width: '100%', padding: '2px 6px', fontSize: 10 }
               }, 'free-input')
             : null
         ] }, q.qid)
       }) }, 'questions'),
       error ? jsx('div', { style: { padding: '0 12px 4px', ...errColor, fontSize: 10 }, role: 'alert', children: error }, 'error') : null,
-      jsx('div', { style: { display: 'flex', alignItems: 'center', gap: 6, padding: '4px 12px 8px' }, children: jsx(Button, {
-        type: 'button',
-        size: 'xs',
-        disabled: submitting || answeredCount === 0,
-        onClick: () => void submit(),
-        children: submitting ? '…' : 'Submit answers'
-      }, 'submit') }, 'actions')
+      jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 6, padding: '4px 12px 8px' }, children: [
+        jsx(Button, {
+          type: 'button',
+          size: 'xs',
+          disabled: submitting || answeredCount === 0,
+          onClick: () => void submit(),
+          children: submitting ? '…' : 'Submit answers'
+        }, 'submit'),
+        jsx('span', { style: { ...textQuaternary, fontSize: 10, fontVariantNumeric: 'tabular-nums' }, children: `${answeredCount} of ${questions.length} answered` }, 'progress')
+      ] }, 'actions')
     ]
   }, 'card')
 }
@@ -837,6 +896,13 @@ function AutomationControls({ ctx, kind, status, liveSessionId, sessionKey, sess
   const qc = useQueryClient()
   const [busy, setBusy] = useState(null)
   const [error, setError] = useState(null)
+  // Synchronous lock: run() is async, so a double-click before the awaited
+  // post settles must not fire a second /control (the finally that clears
+  // `busy` lands a tick later). Also pins the profile at mount (core parity):
+  // pause/resume must land on the backend that listed the automation, not
+  // whichever is active at click time.
+  const runLock = useRef(false)
+  const profileAtMount = useRef(currentProfile())
 
   const canPause = status === 'active'
   const canResume = status === 'paused'
@@ -845,6 +911,12 @@ function AutomationControls({ ctx, kind, status, liveSessionId, sessionKey, sess
   const action = `${kind}.${canPause ? 'pause' : 'resume'}`
 
   const run = async () => {
+    if (runLock.current) return
+    if (currentProfile() !== profileAtMount.current) {
+      setError('Profile changed — re-open to act')
+      return
+    }
+    runLock.current = true
     setBusy(action)
     setError(null)
     try {
@@ -855,12 +927,13 @@ function AutomationControls({ ctx, kind, status, liveSessionId, sessionKey, sess
         // backend can pause/resume persisted automation for a session that is
         // not running (the core direct-state path).
         ...(liveSessionId ? { live_session_id: liveSessionId } : {}),
-        profile: currentProfile()
+        profile: profileAtMount.current
       })
       invalidateActionCenter(qc)
     } catch (err) {
       setError(errMessage(err) || 'Control action failed')
     } finally {
+      runLock.current = false
       setBusy(null)
     }
   }
@@ -1033,20 +1106,33 @@ function ExpiredRequestCard({ ctx, entry, sessionKey }) {
   const qc = useQueryClient()
   const [busy, setBusy] = useState(null)
   const [error, setError] = useState(null)
+  // Synchronous lock: act() is async, so a double-click before the awaited
+  // post settles must not fire a second redo/dismiss. Also pins the profile at
+  // mount (core parity): redo/dismiss target the record the listing backend
+  // knows about.
+  const actLock = useRef(false)
+  const profileAtMount = useRef(currentProfile())
 
   const act = async kind => {
+    if (actLock.current) return
+    if (currentProfile() !== profileAtMount.current) {
+      setError('Profile changed — re-open to act')
+      return
+    }
+    actLock.current = true
     setBusy(kind)
     setError(null)
     try {
       if (kind === 'redo') {
-        await postAction(ctx, '/redo', { request_id: entry.request_id, session_key: sessionKey, profile: currentProfile() })
+        await postAction(ctx, '/redo', { request_id: entry.request_id, session_key: sessionKey, profile: profileAtMount.current })
       } else {
-        await postAction(ctx, '/dismiss', { request_id: entry.request_id, session_key: sessionKey, profile: currentProfile() })
+        await postAction(ctx, '/dismiss', { request_id: entry.request_id, session_key: sessionKey, profile: profileAtMount.current })
       }
       invalidateActionCenter(qc)
     } catch (err) {
       setError(errMessage(err) || 'request failed')
     } finally {
+      actLock.current = false
       setBusy(null)
     }
   }
@@ -1089,6 +1175,14 @@ function InlineDetail({ ctx, item }) {
 
   const retry = () => {
     haptic('tap')
+    invalidateActionCenter(qc)
+    void details.refetch()
+  }
+
+  // Card-level mutations (approve/deny, answer) must re-read BOTH the summary
+  // and this row's details: the resolved request has to leave the card list and
+  // the rail counts before the next poll. onResolved lands here per card.
+  const onCardResolved = () => {
     invalidateActionCenter(qc)
     void details.refetch()
   }
@@ -1160,14 +1254,14 @@ function InlineDetail({ ctx, item }) {
       detailApprovals.length > 0
         ? jsxs('div', { style: { display: 'grid', gap: 8 }, children: [
             sectionLabel('Approvals', detailApprovals.length),
-            jsx('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, marginTop: 4 }, children: detailApprovals.map(a => jsx(ApprovalCard, { ctx, approval: a, sessionKey: item.session_key }, a.request_id || 'approval')) }, 'list')
+            jsx('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, marginTop: 4 }, children: detailApprovals.map(a => jsx(ApprovalCard, { ctx, approval: a, sessionKey: item.session_key, onResolved: onCardResolved }, a.request_id || 'approval')) }, 'list')
           ] }, 'approvals-sec')
         : null,
 
       detailClarifications.length > 0
         ? jsxs('div', { style: { display: 'grid', gap: 8 }, children: [
             sectionLabel('Questions', detailClarifications.length),
-            jsx('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, marginTop: 4 }, children: detailClarifications.map(c => jsx(ClarifyCard, { ctx, clarification: c, sessionKey: item.session_key }, c.request_id || 'clarify')) }, 'list')
+            jsx('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, marginTop: 4 }, children: detailClarifications.map(c => jsx(ClarifyCard, { ctx, clarification: c, sessionKey: item.session_key, onResolved: onCardResolved }, c.request_id || 'clarify')) }, 'list')
           ] }, 'clarify-sec')
         : null,
 
@@ -1197,6 +1291,14 @@ function InlineDetail({ ctx, item }) {
 function ActionCenterPage({ ctx }) {
   const qc = useQueryClient()
   const profile = useValue(host.state.profile)
+  const viewport = useValue(host.state.viewport)
+  // Core parity (PanelBody `min-[47.5rem]:flex-row`): master/detail sit
+  // side-by-side once the VIEWPORT reaches 47.5rem (760px at the app's fixed
+  // --dt-base-size) and stack below it, so the detail keeps full width instead
+  // of being squeezed beside the rail. The 640px `narrow` flag (sidebar
+  // collapse) is NOT PanelBody's breakpoint — gating on it left 640–759px
+  // windows with an 11rem rail beside a stacked body.
+  const stackRailAbove = (viewport?.width ?? 1280) < RAIL_STACK_MIN_PX
   const summary = useSummaryQuery(ctx, profile)
 
   const [category, setCategory] = useState('all')
@@ -1204,6 +1306,14 @@ function ActionCenterPage({ ctx }) {
   const [query, setQuery] = useState('')
   const [narrowDuringSearch, setNarrowDuringSearch] = useState(false)
   const [expandedKey, setExpandedKey] = useState(null)
+  // Scope guard (core parity): a profile switch swaps the whole backend, so the
+  // expanded row (a session of the OLD profile) must collapse synchronously —
+  // queries are already re-keyed by profile, this clears the selection state.
+  const profileScopeRef = useRef(profile)
+  if (profileScopeRef.current !== profile) {
+    profileScopeRef.current = profile
+    setExpandedKey(null)
+  }
 
   const snapshot = summary.data ?? null
   const coverage = snapshot?.coverage ?? null
@@ -1271,7 +1381,18 @@ function ActionCenterPage({ ctx }) {
 
   const retryButton = jsx(Button, { type: 'button', variant: 'secondary', size: 'xs', onClick: refresh, children: 'Try again' }, 'retry')
 
-  const rail = jsxs('div', { style: { width: '11rem', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 2 }, children: [
+  const rail = jsxs('div', {
+    style: {
+      width: stackRailAbove ? '100%' : '11rem',
+      flexShrink: 0,
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 2,
+      // Stacked posture: the rail becomes a horizontal strip pinned to the top,
+      // so the list below keeps the vertical space for rows.
+      ...(stackRailAbove ? { maxHeight: '40%', overflowY: 'auto' } : {})
+    },
+    children: [
     jsx(RailRow, {
       label: 'Needs attention',
       count: needsAttentionCount,
@@ -1349,6 +1470,7 @@ function ActionCenterPage({ ctx }) {
   }
 
   return jsxs('div', {
+    'data-action-center': 'page',
     style: { height: '100%', minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', color: textPrimary.color, fontSize: 12 },
     children: [
       jsx(PanelHeader, {
@@ -1366,7 +1488,7 @@ function ActionCenterPage({ ctx }) {
       }, 'header'),
       jsx(PanelBody, { children: [
         rail,
-        jsxs('div', { style: { display: 'flex', minWidth: 0, flex: 1, flexDirection: 'column', gap: 4 }, children: [
+        jsxs('div', { style: { display: 'flex', minWidth: 0, flex: 1, flexDirection: 'column', gap: stackRailAbove ? 8 : 4 }, children: [
           jsx(SearchField, {
             'aria-label': 'Search sessions',
             placeholder: 'Search title, key, or path…',

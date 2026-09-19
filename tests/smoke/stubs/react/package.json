@@ -1,0 +1,11 @@
+{
+  "name": "react",
+  "version": "18.0.0-harness-stub",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./jsx-runtime": "./jsx-runtime.js"
+  }
+}

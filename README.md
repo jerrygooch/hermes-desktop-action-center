@@ -44,7 +44,11 @@ The UI talks only to its own backend namespace via `ctx.rest`. The backend runs 
 
 ## Status
 
-v0.1.0. The backend test suite and the UI smoke check run green; live in-app verification is ongoing. Feedback and PRs welcome.
+v0.1.0, under review. Automated results and limitations are recorded in `REVIEW.md`; passing offline tests are not a claim of live desktop verification.
+
+**Expired-request capture requires gateway support.** This plugin can read, redo, and dismiss persisted expiry records, but it does not install an approval-settle hook into an unpatched gateway. Automatic capture therefore requires a gateway that already writes the compatible records. Without that support, the expired-request section is not a complete timeout history. A plugin-only alternative would track requests it actually observed and retain a clearly labeled, incomplete history; polling cannot reliably infer whether a disappearing request was answered or expired.
+
+The install link above is a proposed distribution address; the repository has not yet been published.
 
 ## License
 

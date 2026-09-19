@@ -214,6 +214,151 @@ def _record_expired(db, key, *, request_id="exp-1", outcome="timeout", command="
     }, outcome)
 
 
+class _FailingScanDB:
+    """DB wrapper whose ``list_meta_prefix`` always fails (failed-scan regression tests)."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def list_meta_prefix(self, prefix):
+        raise RuntimeError("canary-secret-scan-text")
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+_LOG_HYGIENE_CANARY = "canary-secret-9f3a"
+
+
+def _assert_logs_are_class_only(caplog):
+    """Every backend log record carries the exception CLASS only: no raw text, no tracebacks."""
+    records = [r for r in caplog.records if r.name == "action_center_plugin_api"]
+    assert records, "expected the forced failures to produce backend log records"
+    assert _LOG_HYGIENE_CANARY not in caplog.text  # nowhere, any logger
+    assert all(r.exc_info is None for r in records), "no traceback/exception payload in logs"
+    assert "RuntimeError" in caplog.text  # the safe class name still reaches the log
+
+
+# ── failed DB scans: no false all-clear (direct tests) ────────────────────────
+class TestExpiredScanFailure:
+    """``list_meta_prefix`` failing must never read as "nothing expired"."""
+
+    def test_load_expired_requests_failure_is_named_not_empty(self, server, db):
+        failed = plugin_api.load_expired_requests(_FailingScanDB(db), _new_key())
+        assert plugin_api._expired_read_failed(failed) is True
+        assert failed[0]["error"] == "RuntimeError"  # class only, no raw text
+        assert "canary-secret-scan-text" not in json.dumps(failed)
+
+    def test_load_expired_requests_clean_empty_stays_clean(self, server, db):
+        assert plugin_api.load_expired_requests(db, _new_key()) == []
+        assert plugin_api._expired_read_failed([]) is False
+
+    def test_load_expired_request_counts_failure_is_named(self, server, db):
+        counts, error = plugin_api.load_expired_request_counts(_FailingScanDB(db))
+        assert counts == {}
+        assert error == "RuntimeError"  # class only, no raw text
+
+    def test_load_expired_request_counts_clean_empty_is_not_an_error(self, server, db):
+        assert plugin_api.load_expired_request_counts(db) == ({}, None)
+
+    def test_prune_never_classifies_from_a_failed_scan(self, server, db):
+        key = _create_row(db, _new_key())
+        _record_expired(db, key, request_id="exp-prune")
+        # Under the failing wrapper nothing can be read, so nothing may be deleted.
+        plugin_api._prune_expired_requests(_FailingScanDB(db), key)
+        assert plugin_api.load_expired_requests(db, key)[0]["request_id"] == "exp-prune"
+
+    def test_details_surfaces_failed_expired_read(self, server, db):
+        key = _create_row(db, _new_key())
+        db.append_message(key, "user", "hello")
+        out = plugin_api.action_center_details(session_key=key)
+        assert out["coverage"]["errors"] == []  # clean read: no error
+        assert out["sessions"][0]["expired_requests"] == []
+
+        def failing_load(dbh, session_key):
+            return [{"error": "RuntimeError"}]
+
+        with patch.object(plugin_api, "load_expired_requests", failing_load):
+            failed = plugin_api.action_center_details(session_key=key)
+        assert any(
+            "expired-request read failed" in e for e in failed["coverage"]["errors"])
+        assert failed["sessions"][0]["expired_requests"] == []  # sentinel never rendered
+
+    def test_redo_failed_scan_is_503_not_false_404(self, server, db):
+        key = _create_row(db, _new_key())
+        _record_expired(db, key, request_id="exp-redo")
+        sid = _open_session(server, key)
+        assert sid
+        with patch.object(plugin_api, "_live_session_for_key", lambda *a, **k: sid), \
+                patch.object(plugin_api, "load_expired_requests",
+                             lambda dbh, session_key: [{"error": "RuntimeError"}]):
+            with pytest.raises(Exception) as excinfo:  # noqa: PT011
+                plugin_api.action_center_redo(
+                    plugin_api.RedoBody(request_id="exp-redo", session_key=key))
+        assert getattr(excinfo.value, "status_code", None) == 503
+        assert "expired-request read failed" in str(excinfo.value.detail)
+
+    def test_log_hygiene_canary_never_leaks_secrets(self, server, db, caplog):
+        """Every backend log line carries the exception CLASS only — no raw exception
+        text, no tracebacks — even when every logged failure path is force-failed."""
+        import logging as _logging
+
+        canary = _LOG_HYGIENE_CANARY
+        key = _create_row(db, _new_key())
+
+        with caplog.at_level(_logging.DEBUG):
+            # 0. install the enumeration-failing sessions FIRST: every summary call
+            # below then also exercises the live-session enumeration failure site.
+            server._sessions.clear()
+            server._sessions.update(_BoomSessions())
+            # 1. route guard: unexpected failure inside a guarded route
+            with patch.object(plugin_api, "badge_state",
+                              side_effect=RuntimeError(f"{canary}-guard")):
+                with pytest.raises(Exception):  # noqa: PT011
+                    plugin_api.action_center_summary()
+            # 3. record_expired_request write failure
+            with patch.object(plugin_api, "_prune_expired_requests",
+                              side_effect=RuntimeError(f"{canary}-record")):
+                plugin_api.record_expired_request(db, key, {"request_id": "exp-c"}, "timeout")
+            # 4. expired-request read/scan failures + direct-state snapshot/emit.
+            # Fail at the DB seam so the plugin's OWN handlers (and their logging) run.
+            with patch.object(db, "list_meta_prefix",
+                              side_effect=RuntimeError(f"{canary}-load")):
+                plugin_api.load_expired_requests(db, key)
+                plugin_api.load_expired_request_counts(db)
+            key_stored = _create_row(db, _new_key())
+            _save_goal(key_stored, status="active")
+            with patch.object(plugin_api._server(), "_snapshot_control",
+                              side_effect=RuntimeError(f"{canary}-snapshot")):
+                with pytest.raises(Exception):  # noqa: PT011
+                    plugin_api.action_center_control(
+                        plugin_api.ControlBody(action="goal.pause", session_key=key_stored))
+            with patch.object(plugin_api, "_live_session_for_key", lambda *a, **k: "sid-x"), \
+                    patch.object(plugin_api._server(), "_emit",
+                                 side_effect=RuntimeError(f"{canary}-emit")):
+                plugin_api.action_center_control(
+                    plugin_api.ControlBody(action="goal.resume", session_key=key_stored))
+            # 5. summary listing scan failure
+            with patch.object(plugin_api, "_listing_rows",
+                              side_effect=RuntimeError(f"{canary}-scan")):
+                with pytest.raises(Exception):  # noqa: PT011
+                    plugin_api.action_center_summary()
+
+        _assert_logs_are_class_only(caplog)
+
+
+class _BoomSessions(dict):
+    """dict whose ``items()`` fails (enumeration failure fixture).
+
+    Note: ``dict.update`` bypasses ``items()`` (CPython fast path), so install it
+    with ``clear()`` + ``update()`` and rely on ``items()`` failing only when the
+    plugin actually enumerates.
+    """
+
+    def items(self):
+        raise RuntimeError("boom")
+
+
 # ── /summary: aggregation ──────────────────────────────────────────────────────
 class TestSummary:
     def test_empty_summary_is_stable(self, server, db):
@@ -472,6 +617,63 @@ class TestSummary:
         assert item["subagent_count"] == 0
         assert item["subagent_count_unavailable"] is True
 
+    def test_missing_subagent_registry_module_is_a_coverage_error_not_500(self, server, db, monkeypatch):
+        """A gateway without tools.delegate_tool_registry is a degraded source: the
+        summary still renders with a coverage error and a red badge (never a 500)."""
+        key = _create_row(db, _new_key())
+        _save_goal(key)
+        monkeypatch.setitem(sys.modules, "tools.delegate_tool_registry", None)
+        out = plugin_api.action_center_summary()
+        assert out["badge"] == "red"
+        assert any("subagent enumeration failed" in e for e in out["coverage"]["errors"])
+        item = out["items"][0]
+        assert item["subagent_count"] == 0
+        assert item["subagent_count_unavailable"] is True
+
+    def test_missing_process_registry_module_is_a_coverage_error_not_500(self, server, db, monkeypatch):
+        """Same fail-tolerant treatment for the process registry import."""
+        key = _create_row(db, _new_key())
+        _save_goal(key)
+        monkeypatch.setitem(sys.modules, "tools.process_registry", None)
+        out = plugin_api.action_center_summary()
+        assert out["badge"] == "red"
+        assert any("bg-process enumeration failed" in e for e in out["coverage"]["errors"])
+        item = out["items"][0]
+        assert item["background_task_count"] == 0
+        assert item["background_task_count_unavailable"] is True
+
+    def test_unexpected_summary_failure_is_a_named_503_not_500(self, server, db, monkeypatch):
+        """Parity with the core's outer inbox.list handler: an unhandled failure becomes
+        the named 5031 error (HTTP 503), never a bare 500 and never partial data."""
+        key = _create_row(db, _new_key())
+        _save_goal(key)
+
+        def boom(items, errors=()):
+            raise RuntimeError("super-secret-internal-XYZ")
+
+        monkeypatch.setattr(plugin_api, "badge_state", boom)
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_summary()
+        assert getattr(excinfo.value, "status_code", None) == 503
+        assert str(excinfo.value.detail) == "inbox.list failed"
+        assert "super-secret-internal-XYZ" not in str(excinfo.value.detail)
+
+    def test_unexpected_details_failure_is_a_named_503_not_500(self, server, db, monkeypatch):
+        """Same outer-handler parity for the /details route."""
+        key = _create_row(db, _new_key())
+        _open_session(server, key)
+        db.append_message(key, "user", "hello")
+
+        def boom(dbh, session_key):
+            raise RuntimeError("super-secret-internal-XYZ")
+
+        monkeypatch.setattr(plugin_api, "_build_context_excerpt", boom)
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_details(session_key=key)
+        assert getattr(excinfo.value, "status_code", None) == 503
+        assert str(excinfo.value.detail) == "inbox.requests failed"
+        assert "super-secret-internal-XYZ" not in str(excinfo.value.detail)
+
     def test_unknown_profile_is_a_named_error_not_a_fallback(self, server, db):
         with pytest.raises(Exception) as excinfo:  # noqa: PT011
             plugin_api.action_center_summary(profile="nonexistent-profile-xyz")
@@ -487,6 +689,28 @@ class TestSummary:
         assert "needs_you" in item["lanes"]
         assert item["needs_you_count"] == 1
         assert out["badge"] == "amber"
+
+    def test_failed_expired_scan_is_never_an_all_clear(self, server, db, monkeypatch):
+        """A failed store-wide expired-request scan is NOT a valid empty store:
+        the summary declares partial coverage with a red badge instead of an
+        all-clear, and a clean read with a valid empty store stays clean."""
+        _create_row(db, _new_key())
+        real_load = plugin_api.load_expired_request_counts
+
+        def failing_counts(dbh):
+            return {}, "RuntimeError"  # the failed-scan shape, class name only
+
+        monkeypatch.setattr(plugin_api, "load_expired_request_counts", failing_counts)
+        out = plugin_api.action_center_summary()
+        assert out["badge"] == "red"
+        assert any("expired-request scan failed" in e for e in out["coverage"]["errors"])
+        assert not any("canary" in e.lower() for e in out["coverage"]["errors"])
+        # the clean path is untouched: a valid empty store is NOT an error
+        monkeypatch.setattr(plugin_api, "load_expired_request_counts", real_load)
+        clean = plugin_api.action_center_summary()
+        assert clean["badge"] == "none"
+        assert clean["coverage"]["errors"] == []
+        assert out["items"][0]["expired_request_count"] == 0  # unknown ≠ fabricated count
 
     def test_deny_list_matches_canonical_listing_sources(self):
         from hermes_state_sessions import INTERNAL_LISTING_SOURCES
@@ -889,6 +1113,82 @@ class TestExpiredRequests:
         detail = plugin_api.action_center_details(session_key=key)["sessions"][0]
         assert [e["request_id"] for e in detail["expired_requests"]] == ["exp-1"]
 
+    def test_redo_clear_failure_is_503_not_500(self, server, db, monkeypatch):
+        """A storage failure while clearing the record after an accepted submit becomes
+        the named 503 error — never an unhandled exception (HTTP 500)."""
+        key = _create_row(db, _new_key())
+        _open_session(server, key)
+        _record_expired(db, key)
+        monkeypatch.setitem(server._methods, "prompt.submit",
+                            lambda rid, params: {"result": {"status": "queued"}})
+        monkeypatch.setattr(plugin_api, "clear_expired_request",
+                            lambda db, session_key, request_id: (_ for _ in ()).throw(
+                                RuntimeError("read-only foreign handle")))
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_redo(plugin_api.RedoBody(request_id="exp-1", session_key=key))
+        assert getattr(excinfo.value, "status_code", None) == 503
+        assert "redo failed" in str(excinfo.value.detail)
+        assert "read-only foreign handle" not in str(excinfo.value.detail)  # sanitized
+
+    def test_redo_uses_one_handle_and_keeps_the_record_when_submit_fails_before_clear(self, server, db, monkeypatch):
+        """Lookup and clear share one handle; a submit refusal never reaches the clear."""
+        key = _create_row(db, _new_key())
+        _open_session(server, key)
+        _record_expired(db, key)
+        opens: list[str] = []
+        real_profile_db = server._profile_db
+
+        def counting_profile_db(params=None, *, writer=False):
+            opens.append(str((params or {}).get("profile")))
+            return real_profile_db(params, writer=writer)
+
+        monkeypatch.setattr(server, "_profile_db", counting_profile_db)
+        monkeypatch.setitem(server._methods, "prompt.submit",
+                            lambda rid, params: {"error": {"code": 4009, "message": "session busy"}})
+        with pytest.raises(Exception):  # noqa: PT011 - 409 submit refusal
+            plugin_api.action_center_redo(plugin_api.RedoBody(request_id="exp-1", session_key=key))
+        assert opens == ["None"]  # one handle, launch profile, lookup and clear shared
+        detail = plugin_api.action_center_details(session_key=key)["sessions"][0]
+        assert [e["request_id"] for e in detail["expired_requests"]] == ["exp-1"]
+
+    def test_named_profile_redo_reads_and_clears_in_its_own_store(self, server, db, tmp_path, monkeypatch):
+        """A named profile's redo resolves the record from THAT profile's store — the
+        same store its /details listed it from — and the profile scoping holds."""
+        profile_name = f"prof{uuid.uuid4().hex[:8]}"
+        profile_home = tmp_path / "profiles" / profile_name
+        profile_home.mkdir(parents=True)
+        monkeypatch.setattr(
+            "hermes_cli.profiles._get_profiles_root", lambda: tmp_path / "profiles")
+        key = _new_key("prof")
+        # Seed THAT profile's store with the record via the same seam the route uses.
+        with server._profile_db({"profile": profile_name}, writer=True) as pdb:
+            assert pdb is not None
+            assert plugin_api.record_expired_request(pdb, key,
+                                                     {"request_id": "exp-prof", "command": "cmd-x"},
+                                                     "timeout")
+        _open_session(server, key, profile_home=str(profile_home))
+        with server._profile_db({"profile": profile_name}, writer=True) as pdb:
+            pdb.create_session(key, source="cli")  # the human-facing row the gate requires
+        monkeypatch.setitem(server._methods, "prompt.submit",
+                            lambda rid, params: {"result": {"status": "queued"}})
+        result = plugin_api.action_center_redo(
+            plugin_api.RedoBody(request_id="exp-prof", session_key=key, profile=profile_name))
+        assert result["redone"] is True and result["record_cleared"] is True
+        with server._profile_db({"profile": profile_name}, writer=True) as pdb:
+            assert plugin_api.load_expired_requests(pdb, key) == []
+            assert pdb.get_session(key) is not None  # the human-facing row gate held
+
+    def test_redo_submission_output_is_not_echoed(self, server, db, monkeypatch):
+        """Only the enqueue verdict is reported; the submit envelope's own fields are not."""
+        key = _create_row(db, _new_key())
+        sid = _open_session(server, key)
+        _record_expired(db, key)
+        monkeypatch.setitem(server._methods, "prompt.submit",
+                            lambda rid, params: {"result": {"status": "queued", "notice": "internal detail"}})
+        result = plugin_api.action_center_redo(plugin_api.RedoBody(request_id="exp-1", session_key=key))
+        assert result == {"redone": True, "session_id": sid, "record_cleared": True}
+        assert "internal detail" not in json.dumps(result)
+
 
 # ── /respond: approvals ────────────────────────────────────────────────────────
 class TestRespond:
@@ -959,18 +1259,71 @@ class TestRespond:
         with approval._lock:
             assert approval._gateway_queues.get(key) in (None, [])
 
+    def test_choice_not_offered_by_the_request_is_refused(self, server, db):
+        """A choice the approval payload does not offer can never be submitted: an
+        ``always`` on an allow_permanent=False approval must not mint a permanent
+        rule from the panel (the payload's own choices are the gate)."""
+        from tools import approval
+
+        key = _create_row(db, _new_key())
+        _open_session(server, key)
+        rid = _queue_approval(server, key, allow_permanent=False)
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_respond(
+                plugin_api.RespondBody(request_id=rid, choice="always", session_key=key))
+        assert getattr(excinfo.value, "status_code", None) == 400
+        assert "always" in str(excinfo.value.detail)  # names what was refused
+        with approval._lock:
+            assert len(approval._gateway_queues.get(key, [])) == 1  # untouched
+        # A choice the card actually offers still resolves.
+        assert plugin_api.action_center_respond(
+            plugin_api.RespondBody(request_id=rid, choice="once", session_key=key)) == {"resolved": 1}
+
+    def test_smart_denied_request_refuses_session_and_always(self, server, db):
+        """A smart-denied approval offers only once/deny; session/always are refused."""
+        from tools import approval
+
+        key = _create_row(db, _new_key())
+        _open_session(server, key)
+        rid = _queue_approval(server, key, smart_denied=True)
+        for refused in ("session", "always"):
+            with pytest.raises(Exception) as excinfo:  # noqa: PT011
+                plugin_api.action_center_respond(
+                    plugin_api.RespondBody(request_id=rid, choice=refused, session_key=key))
+            assert getattr(excinfo.value, "status_code", None) == 400, refused
+        with approval._lock:
+            assert len(approval._gateway_queues.get(key, [])) == 1  # untouched
+        assert plugin_api.action_center_respond(
+            plugin_api.RespondBody(request_id=rid, choice="deny", session_key=key)) == {"resolved": 1}
+
+    def test_unknown_request_id_resolves_to_an_honest_zero(self, server, db):
+        """A live session with no such pending request: nothing is fabricated."""
+        key = _create_row(db, _new_key())
+        _open_session(server, key)
+        result = plugin_api.action_center_respond(
+            plugin_api.RespondBody(request_id="rid-never-existed", choice="once", session_key=key))
+        assert result == {"resolved": 0}
+
 
 # ── /answer: clarifications ────────────────────────────────────────────────────
 class TestAnswer:
     def test_missing_request_id_is_400(self, server, db):
         with pytest.raises(Exception) as excinfo:  # noqa: PT011
-            plugin_api.action_center_answer(plugin_api.AnswerBody(request_id="", answer="x"))
+            plugin_api.action_center_answer(plugin_api.AnswerBody(request_id="", answer="x", session_key="k"))
+        assert getattr(excinfo.value, "status_code", None) == 400
+
+    def test_missing_session_key_is_400(self, server, db):
+        """session_key is mandatory: an answer can never be resolved without the
+        durable identity it must be bound to."""
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_answer(plugin_api.AnswerBody(request_id="srq-x", answer="x"))
         assert getattr(excinfo.value, "status_code", None) == 400
 
     def test_single_answer_resolves_the_request(self, server, db):
         key = _create_row(db, _new_key())
         sid, req_id = _queue_clarify(server, key, question="Which backend?")
-        result = plugin_api.action_center_answer(plugin_api.AnswerBody(request_id=req_id, answer="docker"))
+        result = plugin_api.action_center_answer(
+            plugin_api.AnswerBody(request_id=req_id, answer="docker", session_key=key))
         assert result["status"] == "ok"
         sr = server._server_requests
         with sr._lock:
@@ -985,7 +1338,7 @@ class TestAnswer:
         # The panel posts a JSON array; the agent-side result must carry it verbatim
         # so the multi-select answer parses (core response-frame semantics).
         result = plugin_api.action_center_answer(
-            plugin_api.AnswerBody(request_id=req_id, answer=["auth", "cache"]))
+            plugin_api.AnswerBody(request_id=req_id, answer=["auth", "cache"], session_key=key))
         assert result["status"] == "ok"
         assert received == [{"answer": ["auth", "cache"]}]
         sr = server._server_requests
@@ -993,8 +1346,12 @@ class TestAnswer:
             assert req_id not in sr._open
 
     def test_single_answer_expired_request_reports_expired(self, server, db):
+        """A genuinely unknown id for a VALID, LIVE, human-facing owned session keeps
+        the honest ``expired`` semantics — no fabricated success, no error."""
+        key = _create_row(db, _new_key())
+        _queue_clarify(server, key, question="open so the session is live")
         result = plugin_api.action_center_answer(
-            plugin_api.AnswerBody(request_id="srq-not-open-anywhere", answer="x"))
+            plugin_api.AnswerBody(request_id="srq-not-open-anywhere", answer="x", session_key=key))
         assert result["status"] == "expired"
 
     def test_batch_locks_one_call_per_question_last_lock_resolves(self, server, db):
@@ -1005,10 +1362,10 @@ class TestAnswer:
         ]
         _sid, req_id = _queue_batch_clarify(server, key, questions=questions)
         first = plugin_api.action_center_answer(
-            plugin_api.AnswerBody(request_id=req_id, answer="proj-a", question_id="q1"))
+            plugin_api.AnswerBody(request_id=req_id, answer="proj-a", question_id="q1", session_key=key))
         assert first == {"status": "ok", "remaining": ["q2"]}
         last = plugin_api.action_center_answer(
-            plugin_api.AnswerBody(request_id=req_id, answer="rust", question_id="q2"))
+            plugin_api.AnswerBody(request_id=req_id, answer="rust", question_id="q2", session_key=key))
         assert last == {"status": "ok", "remaining": []}
         sr = server._server_requests
         with sr._lock:
@@ -1020,12 +1377,14 @@ class TestAnswer:
         _sid, req_id = _queue_batch_clarify(server, key, questions=questions)
         with pytest.raises(Exception) as excinfo:  # noqa: PT011
             plugin_api.action_center_answer(
-                plugin_api.AnswerBody(request_id=req_id, answer="x", question_id="nope"))
+                plugin_api.AnswerBody(request_id=req_id, answer="x", question_id="nope", session_key=key))
         assert getattr(excinfo.value, "status_code", None) == 400
 
     def test_batch_lock_expired_reports_expired(self, server, db):
+        key = _create_row(db, _new_key())
+        _queue_clarify(server, key, question="open so the session is live")
         result = plugin_api.action_center_answer(
-            plugin_api.AnswerBody(request_id="srq-gone", answer="x", question_id="q1"))
+            plugin_api.AnswerBody(request_id="srq-gone", answer="x", question_id="q1", session_key=key))
         assert result["status"] == "expired"
 
     def test_batch_non_string_answer_json_encoded(self, server, db):
@@ -1033,12 +1392,250 @@ class TestAnswer:
         questions = [{"qid": "q1", "question": "Pick features", "choices": ["a", "b"]}]
         _sid, req_id = _queue_batch_clarify(server, key, questions=questions)
         result = plugin_api.action_center_answer(
-            plugin_api.AnswerBody(request_id=req_id, answer=["a"], question_id="q1"))
+            plugin_api.AnswerBody(request_id=req_id, answer=["a"], question_id="q1", session_key=key))
         # Single-question batch: the last lock resolves the request.
         assert result == {"status": "ok", "remaining": []}
         # The queue's locked answer is the JSON-encoded array string (core semantics).
         details = plugin_api.action_center_details(session_key=key)["sessions"][0]
         assert details["clarifications"] == []  # resolved, so no longer open
+
+
+# ── trust boundary: request ownership & human-facing gates ────────────────────
+class TestTrustBoundary:
+    """Every mutation binds to a human-facing DB session row and to requests the
+    addressed session provably owns — a known foreign id is never resolved."""
+
+    def test_foreign_request_id_is_not_resolved_cross_session(self, server, db):
+        """An answer naming ANOTHER session's clarify id (same profile) resolves
+        nothing: the id is not owned by the addressed session."""
+        key_owner = _create_row(db, _new_key())
+        _sid, foreign_id = _queue_clarify(server, key_owner, question="owner's question")
+        key_attacker = _create_row(db, _new_key())
+        _queue_clarify(server, key_attacker, question="attacker's own open request")
+        result = plugin_api.action_center_answer(
+            plugin_api.AnswerBody(request_id=foreign_id, answer="HIJACKED", session_key=key_attacker))
+        assert result == {"status": "expired"}  # honest expiry, never a resolution
+        sr = server._server_requests
+        with sr._lock:
+            assert foreign_id in sr._open  # the owner's request was untouched
+        snapshots = sr.open_requests(_sid)
+        assert snapshots and snapshots[0]["id"] == foreign_id
+
+    def test_global_resolution_without_ownership_is_denied(self, server, db):
+        """A clarify id from a session NOT addressed must not be globally resolved by
+        a known request id alone — even when the addressed session is live here."""
+        key_live = _create_row(db, _new_key())
+        _sid, foreign_id = _queue_clarify(server, key_live, question="other session's question")
+        key_row_only = _create_row(db, _new_key())
+        _queue_clarify(server, key_row_only, question="addressed session's own open request")
+        result = plugin_api.action_center_answer(
+            plugin_api.AnswerBody(request_id=foreign_id, answer="HIJACKED", session_key=key_row_only))
+        assert result == {"status": "expired"}
+        sr = server._server_requests
+        with sr._lock:
+            assert foreign_id in sr._open
+
+    def test_answer_on_row_without_live_runtime_is_404(self, server, db):
+        """A durable row with NO live runtime cannot be answered (nothing is waiting
+        anywhere reachable): the same 404 the not-live /respond path returns."""
+        key = _create_row(db, _new_key())
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_answer(
+                plugin_api.AnswerBody(request_id="srq-whatever", answer="x", session_key=key))
+        assert getattr(excinfo.value, "status_code", None) == 404
+
+    def test_batch_lock_on_a_foreign_request_id_is_denied(self, server, db):
+        """The batch path binds the same way: a lock on another session's id is expired,
+        and the foreign batch keeps its locked answers untouched."""
+        key_owner = _create_row(db, _new_key())
+        questions = [
+            {"qid": "q1", "question": "Owner q?", "choices": ["a", "b"]},
+            {"qid": "q2", "question": "Owner q2?", "choices": ["c", "d"]},
+        ]
+        _sid, foreign_id = _queue_batch_clarify(server, key_owner, questions=questions)
+        server._server_requests.lock_answer(foreign_id, "q1", "owner-answer")
+        key_attacker = _create_row(db, _new_key())
+        _queue_clarify(server, key_attacker, question="attacker open request")
+        result = plugin_api.action_center_answer(
+            plugin_api.AnswerBody(request_id=foreign_id, answer="HIJACKED",
+                                  question_id="q1", session_key=key_attacker))
+        assert result == {"status": "expired"}
+        snaps = server._server_requests.open_requests(_sid)
+        batch = next(s for s in snaps if s["id"] == foreign_id)
+        assert batch["params"]["answers"] == {"q1": "owner-answer"}  # untouched
+
+    def test_answer_on_unlisted_session_row_is_404(self, server, db):
+        """An addressable-but-unlisted session (no durable row) can never be mutated,
+        and a request minted onto it stays open."""
+        key = _new_key("no-row")
+        _sid, req_id = _queue_clarify(server, key, question="orphan session's question")
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_answer(
+                plugin_api.AnswerBody(request_id=req_id, answer="x", session_key=key))
+        assert getattr(excinfo.value, "status_code", None) == 404
+        assert "session not found" in str(excinfo.value.detail)
+        with server._server_requests._lock:
+            assert req_id in server._server_requests._open
+
+    def test_answer_on_deny_listed_session_is_404(self, server, db):
+        """A deny-listed (kanban) session is not human-facing: /answer refuses with
+        the core's session-not-found refusal and never touches its live request."""
+        key = _create_row(db, _new_key(), source="kanban")
+        _sid, req_id = _queue_clarify(server, key, question="kanban question")
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_answer(
+                plugin_api.AnswerBody(request_id=req_id, answer="x", session_key=key))
+        assert getattr(excinfo.value, "status_code", None) == 404
+        with server._server_requests._lock:
+            assert req_id in server._server_requests._open
+
+    def test_respond_on_deny_listed_session_does_not_consume_the_queue(self, server, db):
+        """A deny-listed session's pending approval can never be approved from the
+        panel: 404 and the queue entry survives untouched."""
+        from tools import approval
+
+        hidden = _create_row(db, _new_key(), source="kanban")
+        _open_session(server, hidden)
+        _queue_approval(server, hidden)
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_respond(
+                plugin_api.RespondBody(request_id="rid-hidden", choice="once", session_key=hidden))
+        assert getattr(excinfo.value, "status_code", None) == 404
+        with approval._lock:
+            assert len(approval._gateway_queues.get(hidden, [])) == 1  # untouched
+
+    def test_dismiss_on_unlisted_session_is_404_no_side_effect(self, server, db):
+        """Dismiss refuses a session with no durable row, and the expired record
+        is untouched (no side effect)."""
+        key = _new_key("ghost")
+        db2 = server._get_db()
+        plugin_api.record_expired_request(db2, key, {"request_id": "g-1", "command": "c"}, "timeout")
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_dismiss(plugin_api.DismissBody(request_id="g-1", session_key=key))
+        assert getattr(excinfo.value, "status_code", None) == 404
+        assert "session not found" in str(excinfo.value.detail)
+        assert [e["request_id"] for e in plugin_api.load_expired_requests(db2, key)] == ["g-1"]
+
+    def test_dismiss_on_deny_listed_session_is_404_no_side_effect(self, server, db):
+        hidden = _create_row(db, _new_key(), source="kanban")
+        _record_expired(db, hidden)
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_dismiss(
+                plugin_api.DismissBody(request_id="exp-1", session_key=hidden))
+        assert getattr(excinfo.value, "status_code", None) == 404
+        assert [e["request_id"] for e in plugin_api.load_expired_requests(db, hidden)] == ["exp-1"]
+
+    def test_redo_on_unlisted_session_is_404_no_prompt(self, server, db, monkeypatch):
+        """Redo refuses an unlisted session BEFORE any prompt.submit can fire."""
+        key = _new_key("ghost")
+        db2 = server._get_db()
+        plugin_api.record_expired_request(db2, key, {"request_id": "g-1", "command": "c"}, "timeout")
+        _open_session(server, key)  # live, so the old gate order would have reached submit
+        submitted: list = []
+
+        def _spy_submit(rid, params):
+            submitted.append(params)
+            return {"result": {"status": "queued"}}
+
+        monkeypatch.setitem(server._methods, "prompt.submit", _spy_submit)
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_redo(plugin_api.RedoBody(request_id="g-1", session_key=key))
+        assert getattr(excinfo.value, "status_code", None) == 404
+        assert submitted == []  # no prompt was ever raised
+
+    def test_redo_on_deny_listed_session_is_404(self, server, db):
+        hidden = _create_row(db, _new_key(), source="kanban")
+        _record_expired(db, hidden)
+        _open_session(server, hidden)
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_redo(plugin_api.RedoBody(request_id="exp-1", session_key=hidden))
+        assert getattr(excinfo.value, "status_code", None) == 404
+        assert "session not found" in str(excinfo.value.detail)
+
+    def test_control_live_path_on_unlisted_session_never_dispatches(self, server, db, monkeypatch):
+        """A live runtime for a session with NO durable row must not be driven:
+        neither the live session.control path nor the direct-state path runs."""
+        ghost_key = _new_key("ghost")
+        sid = _open_session(server, ghost_key)
+        from hermes_cli.goals import save_goal, GoalState
+
+        save_goal(ghost_key, GoalState(goal="sneaky", status="active", turns_used=1,
+                                       max_turns=6, created_at=100.0, last_turn_at=200.0))
+        calls: list = []
+
+        def spy(rid, params):
+            calls.append(dict(params))
+            return {"result": {}}
+
+        monkeypatch.setitem(server._methods, "session.control", spy)
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_control(
+                plugin_api.ControlBody(action="goal.pause", session_key=ghost_key, live_session_id=sid))
+        assert getattr(excinfo.value, "status_code", None) == 404
+        assert calls == []  # the live runtime was never dispatched
+
+    def test_control_live_path_on_deny_listed_session_never_dispatches(self, server, db, monkeypatch):
+        hidden = _create_row(db, _new_key(), source="kanban")
+        sid = _open_session(server, hidden)
+        _save_goal(hidden, status="active")
+        calls: list = []
+
+        def spy(rid, params):
+            calls.append(dict(params))
+            return {"result": {}}
+
+        monkeypatch.setitem(server._methods, "session.control", spy)
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011
+            plugin_api.action_center_control(
+                plugin_api.ControlBody(action="goal.pause", session_key=hidden, live_session_id=sid))
+        assert getattr(excinfo.value, "status_code", None) == 404
+        assert calls == []
+
+    def test_answer_bound_to_compute_host_relay_owned_by_session(self, server, db, monkeypatch):
+        """The positive remote path: a clarify request mirrored onto THIS session's
+        live runtime (compute-host ownership) is answerable from the panel; the
+        answer is relayed to the child that owns the request."""
+        key = _create_row(db, _new_key())
+        sid = _open_session(server, key)
+        session = server._sessions[sid]
+        session["_compute_host_active"] = True
+        session["_compute_host_open_request"] = {
+            "id": "srq-host-1", "method": "clarify", "params": {"session_id": sid, "question": "host q"}}
+        relays: list = []
+
+        def fake_relay(frame):
+            relays.append(dict(frame))
+            # Consume the mirror exactly as the real bridge does on a relay.
+            with session["history_lock"]:
+                session.pop("_compute_host_open_request", None)
+            return True
+
+        monkeypatch.setattr(plugin_api._server(), "_relay_compute_host_response", fake_relay)
+        result = plugin_api.action_center_answer(
+            plugin_api.AnswerBody(request_id="srq-host-1", answer="host-answer", session_key=key))
+        assert result == {"status": "ok"}
+        assert relays == [{"jsonrpc": "2.0", "id": "srq-host-1", "result": {"answer": "host-answer"}}]
+        # ...and the mirror is consumed exactly as the real bridge does on relay.
+        assert "_compute_host_open_request" not in session or session.get("_compute_host_open_request") is None
+
+    def test_compute_host_relay_refused_for_a_foreign_session(self, server, db):
+        """A mirrored host request owned by ANOTHER session is not relayable through
+        THIS session's answer: ownership is per-session, fail closed."""
+        key_owner = _create_row(db, _new_key())
+        sid_owner = _open_session(server, key_owner)
+        server._sessions[sid_owner]["_compute_host_active"] = True
+        server._sessions[sid_owner]["_compute_host_open_request"] = {
+            "id": "srq-host-foreign", "method": "clarify", "params": {"session_id": sid_owner}}
+        key_attacker = _create_row(db, _new_key())
+        sid_attacker = _open_session(server, key_attacker)
+        server._sessions[sid_attacker]["_compute_host_active"] = True
+        result = plugin_api.action_center_answer(
+            plugin_api.AnswerBody(request_id="srq-host-foreign", answer="HIJACKED",
+                                  session_key=key_attacker))
+        assert result == {"status": "expired"}
+        # The owner's mirror is untouched.
+        with server._sessions[sid_owner]["history_lock"]:
+            assert server._sessions[sid_owner]["_compute_host_open_request"]["id"] == "srq-host-foreign"
 
 
 # ── /control: automation pause/resume ─────────────────────────────────────────
@@ -1184,9 +1781,95 @@ class TestControl:
         command result ("No goal set."), not an error — the same words the chat shows."""
         sid = _open_session(server, _new_key())
         key = server._sessions[sid]["session_key"]
+        _create_row(db, key)
         result = plugin_api.action_center_control(
             plugin_api.ControlBody(action="goal.pause", session_key=key, live_session_id=sid))
         assert result["dispatch"]["output"] == "No goal set."
+
+    def test_live_id_of_another_session_never_drives_that_session(self, server, db, monkeypatch):
+        """A live_session_id pointing at a DIFFERENT session must not be dispatched:
+        the live path only runs when the id provably binds to session_key + profile."""
+        sid_other = _open_session(server, _new_key())
+        key_other = server._sessions[sid_other]["session_key"]
+        _create_row(db, key_other)
+        _save_goal(key_other)  # a live goal the buggy path would have paused
+        key = _create_row(db, _new_key())
+        _save_goal(key, status="active")
+        calls: list[dict] = []
+
+        def spy(rid, params):
+            calls.append(dict(params))
+            raise AssertionError("foreign live id must not reach session.control")
+
+        monkeypatch.setitem(server._methods, "session.control", spy)
+        result = plugin_api.action_center_control(
+            plugin_api.ControlBody(action="goal.pause", session_key=key, live_session_id=sid_other))
+        assert calls == []
+        assert result["control"]["goal"]["status"] == "paused"  # gated direct path ran for OUR key
+        from hermes_cli.goals import load_goal
+        assert load_goal(key).status == "paused"
+        assert load_goal(key_other).status == "active"  # the other session's goal was never touched
+
+    def test_live_id_from_a_foreign_profile_is_not_dispatched(self, server, db, monkeypatch):
+        """A runtime record owned by another profile home must not take the live path."""
+        key = _create_row(db, _new_key())
+        sid = _open_session(server, key, profile_home="/completely/different/home")
+        _save_goal(key, status="active")
+        calls: list[dict] = []
+
+        def spy(rid, params):
+            calls.append(dict(params))
+            raise AssertionError("foreign-profile live id must not reach session.control")
+
+        monkeypatch.setitem(server._methods, "session.control", spy)
+        result = plugin_api.action_center_control(
+            plugin_api.ControlBody(action="goal.pause", session_key=key, live_session_id=sid))
+        assert calls == []
+        assert result["control"]["goal"]["status"] == "paused"
+        # ...and the refresh emit never targets the foreign runtime either.
+        emitted: list[tuple] = []
+        monkeypatch.setattr(server, "_emit",
+                            lambda event, s, payload=None: emitted.append((event, s, payload)))
+        plugin_api.action_center_control(
+            plugin_api.ControlBody(action="goal.resume", session_key=key, live_session_id=sid))
+        assert emitted == []
+
+    def test_finalized_runtime_id_falls_back_to_the_direct_path(self, server, db, monkeypatch):
+        """A reaped/finalized runtime id is stale: the gated direct-state path applies."""
+        key = _create_row(db, _new_key())
+        sid = _open_session(server, key)
+        server._sessions[sid]["_finalized"] = True
+        _save_goal(key, status="active")
+        calls: list[dict] = []
+
+        def spy(rid, params):
+            calls.append(dict(params))
+            raise AssertionError("finalized live id must not reach session.control")
+
+        monkeypatch.setitem(server._methods, "session.control", spy)
+        result = plugin_api.action_center_control(
+            plugin_api.ControlBody(action="goal.pause", session_key=key, live_session_id=sid))
+        assert calls == []
+        assert result["control"]["goal"]["status"] == "paused"
+
+    def test_live_id_still_takes_the_live_path_when_bound(self, server, db, monkeypatch):
+        """The gate is identity-only: a correctly bound id still reaches session.control."""
+        sid = _open_session(server, _new_key())
+        key = server._sessions[sid]["session_key"]
+        _create_row(db, key)
+        _save_goal(key, status="active")
+        calls: list[dict] = []
+        real = server._methods["session.control"]
+
+        def observe(rid, params):
+            calls.append(dict(params))
+            return real(rid, params)
+
+        monkeypatch.setitem(server._methods, "session.control", observe)
+        result = plugin_api.action_center_control(
+            plugin_api.ControlBody(action="goal.pause", session_key=key, live_session_id=sid))
+        assert result["control"]["goal"]["status"] == "paused"
+        assert calls and calls[0]["session_id"] == sid and calls[0]["action"] == "goal.pause"
 
 
 # ── FastAPI REST contract ─────────────────────────────────────────────────────
@@ -1253,7 +1936,7 @@ class TestRestContract:
 
         _sid, clarify_id = _queue_clarify(mod, key, question="Which?")
         response = client.post("/api/plugins/action-center/answer",
-                               json={"request_id": clarify_id, "answer": "docker"})
+                               json={"request_id": clarify_id, "answer": "docker", "session_key": key})
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
 
@@ -1268,6 +1951,73 @@ class TestRestContract:
         response = client.post("/api/plugins/action-center/dismiss",
                                json={"request_id": "exp-http", "session_key": key})
         assert response.status_code == 404
+
+    def test_dismiss_on_a_named_profile_clears_that_store(self, client, server, db, tmp_path, monkeypatch):
+        """Dismiss on a named profile deletes from THAT profile's store — the route
+        writes through the core's cross-profile writer seam (read-only handles cannot)."""
+        profile_name = f"prof{uuid.uuid4().hex[:8]}"
+        profile_home = tmp_path / "profiles" / profile_name
+        profile_home.mkdir(parents=True)
+        monkeypatch.setattr(
+            "hermes_cli.profiles._get_profiles_root", lambda: tmp_path / "profiles")
+        key = _new_key("prof")
+        with server._profile_db({"profile": profile_name}, writer=True) as pdb:
+            assert plugin_api.record_expired_request(pdb, key,
+                                                     {"request_id": "exp-prof", "command": "cmd-x"},
+                                                     "timeout")
+            pdb.create_session(key, source="cli")  # the human-facing row the gate requires
+        response = client.post("/api/plugins/action-center/dismiss",
+                               json={"request_id": "exp-prof", "session_key": key, "profile": profile_name})
+        assert response.status_code == 200
+        assert response.json() == {"dismissed": True}
+        with server._profile_db({"profile": profile_name}, writer=True) as pdb:
+            assert plugin_api.load_expired_requests(pdb, key) == []
+
+    def test_respond_choice_gate_over_http(self, client, db):
+        """The offered-choices gate holds over the REST surface: 400 with the core-style
+        detail, and the queue entry survives untouched."""
+        from tools import approval
+
+        key = _create_row(db, _new_key())
+        _open_session(_server_module(), key)
+        rid = _queue_approval(_server_module(), key, allow_permanent=False)
+        response = client.post("/api/plugins/action-center/respond",
+                               json={"request_id": rid, "choice": "always", "session_key": key})
+        assert response.status_code == 400
+        assert "always" in response.json()["detail"]
+        with approval._lock:
+            assert len(approval._gateway_queues.get(key, [])) == 1
+
+
+def test_answer_ownership_read_failure_is_not_expiry(server, db, monkeypatch):
+    from fastapi import HTTPException
+    key = _create_row(db, _new_key())
+    _open_session(server, key)
+    def broken(_sid):
+        raise RuntimeError("secret-canary-must-not-leak")
+    monkeypatch.setattr(server, "_open_requests", broken)
+    with pytest.raises(HTTPException) as caught:
+        plugin_api.action_center_answer(plugin_api.AnswerBody(
+            request_id="unknown", session_key=key, answer="test"))
+    assert caught.value.status_code == 503
+    assert caught.value.detail == "request ownership read failed: RuntimeError"
+
+
+def test_answer_refuses_non_clarify_request_in_owned_session(server, db, monkeypatch):
+    key = _create_row(db, _new_key())
+    _open_session(server, key)
+    monkeypatch.setattr(server, "_open_requests", lambda sid: [
+        {"id": "not-a-question", "method": "secret", "params": {}}])
+    from tui_gateway import server_requests
+    resolve = MagicMock()
+    relay = MagicMock()
+    monkeypatch.setattr(server_requests, "resolve_response", resolve)
+    monkeypatch.setattr(server, "_relay_compute_host_response", relay)
+    result = plugin_api.action_center_answer(plugin_api.AnswerBody(
+        request_id="not-a-question", session_key=key, answer="test"))
+    assert result == {"status": "expired"}
+    resolve.assert_not_called()
+    relay.assert_not_called()
 
 
 def _server_module():

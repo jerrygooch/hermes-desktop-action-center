@@ -1,27 +1,48 @@
 // Offline smoke harness for the Action Center desktop plugin.
 //
-// Loads desktop/plugin.js with stubbed SDK/React modules, runs register(ctx),
-// then walks every registered render with (a) populated sample data, (b) empty
-// data, (c) an error state, and additionally (d) partial coverage, (e) an
+// Loads desktop/plugin.js with stubbed SDK/React modules (bootstrapped from the
+// tracked sources in stubs/ so a clean checkout runs without preparation), runs
+// register(ctx), then walks every registered render with (a) populated sample
+// data, (b) empty data, (c) an error state, (d) partial coverage, (e) an
 // expanded-row interaction walk and (f) mutation scripting that asserts the
-// exact REST routes the SPEC defines. Collects reference errors and asserts
-// contribution shapes/paths/labels.
+// exact REST routes the SPEC defines. Hook state is reset between steps so no
+// scenario leaks into the next.
 //
-// Run: node tests/smoke/run.mjs
-import { readFileSync, writeFileSync } from 'node:fs'
+// Run: node tests/smoke/run.mjs        (plain node, no dependencies)
+import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, cpSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(here, '..', '..')
 
+// ── bootstrap: tracked stubs → node_modules (fresh-checkout reproducibility) ──
+// node_modules/ is gitignored; the stubs live in tests/smoke/stubs/ (tracked)
+// and are copied into node_modules before the plugin import resolves them.
+for (const dir of ['@hermes/plugin-sdk', 'react']) {
+  if (!existsSync(path.join(here, 'stubs', dir, 'package.json'))) {
+    console.error(`bootstrap failed: tests/smoke/stubs/${dir} is missing`)
+    process.exit(1)
+  }
+}
+rmSync(path.join(here, 'node_modules'), { recursive: true, force: true })
+for (const dir of ['@hermes/plugin-sdk', 'react']) {
+  mkdirSync(path.join(here, 'node_modules', path.dirname(dir)), { recursive: true })
+  cpSync(path.join(here, 'stubs', dir), path.join(here, 'node_modules', dir), { recursive: true })
+}
+
 // Import the plugin THROUGH the stub node_modules beside this file (a copy of
 // desktop/plugin.js) so `@hermes/plugin-sdk` resolves to the stubs.
-const pluginSource = readFileSync(path.join(repoRoot, 'desktop', 'plugin.js'), 'utf8')
-writeFileSync(path.join(here, 'plugin.js'), pluginSource)
+writeFileSync(path.join(here, 'plugin.js'), readFileSync(path.join(repoRoot, 'desktop', 'plugin.js'), 'utf8'))
 
 const mod = await import('./plugin.js')
 const plugin = mod.default
+
+const { renderPass, invokeComponent, clickableByText, collectByType, collectBranchClickables, flattenTexts, childText } = await import('./walker.mjs')
+const {
+  SUMMARY_POPULATED, SUMMARY_EMPTY, SUMMARY_PARTIAL, DETAILS_POPULATED, DETAILS_RESTRICTED,
+  SUMMARY_KEY_LIVE, DETAILS_KEY_LIVE
+} = await import('./fixtures.mjs')
 
 let failed = 0
 const checks = []
@@ -33,291 +54,6 @@ const check = (name, ok, detail) => {
 const renderErrors = [] // [path, error]
 const restCalls = [] // [{ path, opts }]
 
-// ── sample data (mirrors the core PR's e2e fixtures) ─────────────────────────
-
-const goalSnapshot = {
-  title: 'Ship approved changes',
-  status: 'active',
-  turns_used: 3,
-  max_turns: 20,
-  contract: { outcome: 'Changelog updated', verification: 'unit tests', stop_when: 'changelog merged' },
-  subgoals: ['Update changelog', 'Tag the release'],
-  gates: [{ command: 'pytest -q', attempts: 2, last_exit_code: 0 }],
-  wait_barrier: null,
-  paused_reason: null,
-  last_verdict: 'pass'
-}
-const loopSnapshot = {
-  prompt: 'Check deployment health on staging',
-  status: 'active',
-  interval_seconds: 1800,
-  ticks_fired: 4,
-  times: 10,
-  until: 'error rate is zero for 10 minutes',
-  next_due_at: Math.floor(Date.now() / 1000) + 600,
-  last_fired_at: Math.floor(Date.now() / 1000) - 1200,
-  awaiting_response: false,
-  deferred_by_goal: false,
-  mode: null,
-  max_ticks: null,
-  paused_reason: null,
-  last_stop_reason: null
-}
-const heartbeatSnapshot = {
-  prompt: 'Morning check',
-  status: 'paused',
-  interval_seconds: 1800,
-  fire_count: 5,
-  last_fired_at: Math.floor(Date.now() / 1000) - 3600
-}
-
-const ITEMS = [
-  {
-    session_key: 'gallery-goals', title: 'Deploy pipeline', source: 'terminal', cwd: 'C:/w/demo',
-    lanes: ['needs_you', 'running'], categories: ['goals'],
-    pending_approval: { count: 1, command_redacted: true, description: 'Deploy command' },
-    pending_clarify: null, expired_request_count: 1,
-    goal: goalSnapshot, loop: null, heartbeat: null,
-    subagent_count: 0, subagent_count_unavailable: false,
-    background_task_count: 0, background_task_count_unavailable: false
-  },
-  {
-    session_key: 'gallery-loops', title: 'Staging watchdog', source: 'terminal', cwd: 'C:/w/demo',
-    lanes: ['running'], categories: ['loops'],
-    pending_approval: null, pending_clarify: { count: 1 }, expired_request_count: 0,
-    goal: null, loop: loopSnapshot, heartbeat: null,
-    subagent_count: 0, subagent_count_unavailable: false,
-    background_task_count: 0, background_task_count_unavailable: false
-  },
-  {
-    session_key: 'gallery-heartbeats', title: 'Morning checks', source: 'cron', cwd: 'C:/w/demo',
-    lanes: ['scheduled'], categories: ['heartbeats'],
-    pending_approval: null, pending_clarify: null, expired_request_count: 0,
-    goal: null, loop: null, heartbeat: heartbeatSnapshot,
-    subagent_count: 0, subagent_count_unavailable: false,
-    background_task_count: 0, background_task_count_unavailable: false
-  },
-  {
-    session_key: 'gallery-subagents', title: 'Review crew', source: 'terminal', cwd: 'C:/w/demo',
-    lanes: ['waiting'], categories: ['subagents'],
-    pending_approval: null, pending_clarify: null, expired_request_count: 0,
-    goal: null, loop: null, heartbeat: null,
-    subagent_count: 3, subagent_count_unavailable: false,
-    background_task_count: 0, background_task_count_unavailable: false
-  },
-  {
-    session_key: 'gallery-background_tasks', title: 'Long renders', source: 'terminal', cwd: 'C:/w/demo',
-    lanes: ['running'], categories: ['background_tasks'],
-    pending_approval: null, pending_clarify: null, expired_request_count: 0,
-    goal: null, loop: null, heartbeat: null,
-    subagent_count: 0, subagent_count_unavailable: false,
-    background_task_count: 2, background_task_count_unavailable: false
-  },
-  {
-    session_key: 'gallery-other', title: 'Everything else', source: 'terminal', cwd: 'C:/w/demo',
-    lanes: ['waiting'], categories: [], // no recognized category → 'Other' rail row appears
-    pending_approval: null, pending_clarify: null, expired_request_count: 0,
-    goal: null, loop: null, heartbeat: null,
-    subagent_count: 0, subagent_count_unavailable: false,
-    background_task_count: 0, background_task_count_unavailable: false
-  }
-]
-
-const SUMMARY_POPULATED = {
-  badge: 'amber',
-  counts: { needs_you: 1, running: 2, waiting: 2, scheduled: 1, total: 6 },
-  coverage: {
-    profile: 'default', connection_scope: 'active connection and profile only',
-    scanned_sessions: 6, partial: false, approval_scope: 'fixture', clarify_scope: 'fixture', errors: []
-  },
-  items: ITEMS
-}
-
-const CONTEXT = {
-  available: true,
-  reason: null,
-  messages: [
-    { role: 'user', text: 'Clean up the stale build cache before the staging deploy finishes.', timestamp: 1789765000 },
-    { role: 'assistant', text: 'Staging is green. I want to clear /tmp/build-cache, then finish the deploy.', timestamp: 1789765060 }
-  ]
-}
-
-const DETAILS_POPULATED = {
-  coverage: { approval_count: 1, clarification_count: 3, context_anchor: 'session:gallery-goals', errors: [], live_session_count: 1, profile: 'default', session_key: 'gallery-goals' },
-  sessions: [{
-    live_session_ids: ['live-1'],
-    context: CONTEXT,
-    approvals: [{
-      request_id: 'req-approval-1', command: 'rm -rf /tmp/build-cache', description: 'Delete build cache directory',
-      choices: ['once', 'session', 'always', 'deny'], allow_session: true, allow_permanent: true, smart_denied: null, tool_name: 'terminal'
-    }],
-    clarifications: [
-      { request_id: 'req-clarify-1', kind: 'single', params: { question: 'Which language should the new module be written in?', choices: ['TypeScript', 'Python', 'Rust'], multi_select: false } },
-      { request_id: 'req-clarify-multi', kind: 'single', params: { question: 'Which areas need the most improvement?', choices: ['Error handling', 'Performance', 'Documentation', 'Testing'], multi_select: true } },
-      {
-        request_id: 'req-batch-1', kind: 'batch', params: {
-          questions: [
-            { qid: 'q1', question: 'Priority level?', choices: ['Low', 'Medium', 'High'], multi_select: false },
-            { qid: 'q2', question: 'Target environment?', choices: ['Staging', 'Production'], multi_select: false },
-            { qid: 'q3', question: 'Run additional checks?', choices: ['Lint', 'Typecheck', 'Unit tests'], multi_select: true }
-          ]
-        }
-      }
-    ],
-    expired_requests: [
-      { request_id: 'req-expired-1', kind: 'approval', command: 'dangerous-script.sh', description: 'Restricted approval', ended_at: Math.floor(Date.now() / 1000) - 120, outcome: 'timeout' }
-    ]
-  }]
-}
-
-const DETAILS_RESTRICTED = {
-  coverage: { approval_count: 1, clarification_count: 0, context_anchor: 'unavailable: open chat for context', errors: [], live_session_count: 1, profile: 'default', session_key: 'gallery-background_tasks' },
-  sessions: [{
-    live_session_ids: ['live-5'],
-    context: { available: false, reason: 'no displayable rows', messages: [] },
-    approvals: [{
-      request_id: 'req-approval-restricted', command: 'dangerous-script.sh', description: 'Restricted approval',
-      choices: ['once', 'session', 'always', 'deny'], allow_session: false, allow_permanent: false, smart_denied: null, tool_name: 'terminal'
-    }],
-    clarifications: [],
-    expired_requests: []
-  }]
-}
-
-const SUMMARY_EMPTY = {
-  badge: 'none',
-  counts: { needs_you: 0, running: 0, waiting: 0, scheduled: 0, total: 0 },
-  coverage: {
-    profile: 'default', connection_scope: 'active connection and profile only',
-    scanned_sessions: 0, partial: false, approval_scope: 'fixture', clarify_scope: 'fixture', errors: []
-  },
-  items: []
-}
-
-const SUMMARY_PARTIAL = {
-  badge: 'red',
-  counts: { needs_you: 0, running: 0, waiting: 0, scheduled: 0, total: 0 },
-  coverage: {
-    profile: 'default', connection_scope: 'active connection and profile only',
-    scanned_sessions: 0, partial: true, approval_scope: 'fixture', clarify_scope: 'fixture',
-    errors: ['Session snapshot failed: timeout']
-  },
-  items: []
-}
-
-// ── tree walkers (component-scoped hook emulation) ───────────────────────────
-
-// Invoke a function component with the react stub's hook scope pointed at it.
-// Stub (UI-kit) components are pass-throughs and need no scope of their own.
-function invokeComponent(type, props) {
-  const name = type.name || 'anon'
-  const prevName = globalThis.__componentName
-  const prevCursor = globalThis.__hookCursor
-  if (name !== 'Stub') {
-    globalThis.__componentName = name
-    globalThis.__hookCursor = 0
-  }
-  try {
-    return type({ ...props })
-  } finally {
-    globalThis.__componentName = prevName
-    globalThis.__hookCursor = prevCursor
-  }
-}
-
-function walk(node, path, depth = 0) {
-  if (node == null || typeof node === 'boolean' || typeof node === 'string' || typeof node === 'number') return
-  if (Array.isArray(node)) {
-    node.forEach((child, i) => walk(child, `${path}[${i}]`, depth + 1))
-    return
-  }
-  if (typeof node === 'object' && node.__frag) {
-    walk(node.children, `${path}#frag`, depth + 1)
-    return
-  }
-  if (typeof node === 'object' && node.__el) {
-    const { type, props } = node
-    if (type == null) {
-      renderErrors.push([path, new Error('element with null/undefined type')])
-      return
-    }
-    if (typeof type === 'function') {
-      try {
-        walk(invokeComponent(type, props), `${path}>${type.name || 'anon'}`, depth + 1)
-      } catch (e) {
-        renderErrors.push([`${path}>${type.name || 'anon'}`, e])
-      }
-    } else {
-      walk(props && props.children, `${path}<${type}>`, depth + 1)
-    }
-    return
-  }
-  if (typeof node === 'object' && node.$$typeof) return
-}
-
-// Depth-first collection of every element carrying an onClick. Component
-// functions are invoked (scope-managed) so their bodies are included.
-function collectClickables(node, out, depth = 0) {
-  if (node == null || typeof node === 'boolean' || typeof node === 'string' || typeof node === 'number') return
-  if (Array.isArray(node)) {
-    node.forEach(child => collectClickables(child, out, depth + 1))
-    return
-  }
-  if (typeof node === 'object' && node.__frag) {
-    collectClickables(node.children, out, depth + 1)
-    return
-  }
-  if (typeof node === 'object' && node.__el) {
-    // A Button stub element carries onClick on the element itself even though
-    // its type is a function component — capture it before descending.
-    if (node.props && typeof node.props.onClick === 'function') out.push(node)
-    if (typeof node.type === 'function') {
-      let branch = null
-      try {
-        branch = invokeComponent(node.type, node.props)
-      } catch (e) {
-        renderErrors.push([`collect>${node.type.name || 'anon'}`, e])
-        return
-      }
-      collectClickables(branch, out, depth + 1)
-      return
-    }
-    collectClickables(node.props && node.props.children, out, depth + 1)
-    return
-  }
-  if (typeof node === 'object' && node.$$typeof) return
-}
-
-// Flatten an element's visible text (frag/component-aware) for label assertions.
-function childText(c) {
-  if (typeof c === 'string' || typeof c === 'number') return String(c)
-  if (Array.isArray(c)) return c.map(childText).join('')
-  if (c && typeof c === 'object') {
-    if (c.__frag) return childText(c.children)
-    if (c.__el && typeof c.type === 'function') {
-      const name = c.type.name || 'anon'
-      if (name === 'Stub') return childText(c.props?.children)
-      let branch = null
-      try { branch = invokeComponent(c.type, c.props) } catch { return '' }
-      return childText(branch?.props?.children)
-    }
-    if (c.props?.children !== undefined) return childText(c.props.children)
-  }
-  return ''
-}
-
-function renderContribution(contribution, label) {
-  if (typeof contribution.render !== 'function') return null
-  try {
-    const tree = contribution.render()
-    walk(tree, label)
-    return tree
-  } catch (e) {
-    renderErrors.push([label, e])
-    return null
-  }
-}
-
 // ── ctx wiring ───────────────────────────────────────────────────────────────
 
 function makeCtx() {
@@ -328,9 +64,9 @@ function makeCtx() {
     register: c => registered.push(c),
     registerMany: cs => registered.push(...cs),
     storage: { get: (_k, d) => d, set() {}, remove() {} },
-    rest: async (path, opts) => {
-      restCalls.push({ path, opts })
-      if (globalThis.__AC_REST) return globalThis.__AC_REST(path, opts)
+    rest: async (routePath, opts) => {
+      restCalls.push({ path: routePath, opts })
+      if (globalThis.__AC_REST) return globalThis.__AC_REST(routePath, opts)
       return {}
     },
     socket: () => () => {},
@@ -338,17 +74,20 @@ function makeCtx() {
   }
 }
 
+const reactStub = await import('react')
+const sdkStub = await import('@hermes/plugin-sdk')
+
+// Fresh scenario: wipe injected data/errors/REST scripting/observations AND the
+// react stub's hook slots, so each step's renders start from initial state.
 function resetGlobals() {
-  for (const key of ['__AC_DATA', '__AC_ERR', '__AC_NOTES', '__AC_ROWS', '__AC_EVENTS', '__AC_REST', '__AC_SESSIONS', '__AC_WORKSPACES', '__AC_INVALIDATIONS']) {
+  for (const key of ['__AC_DATA', '__AC_ERR', '__AC_NOTES', '__AC_ROWS', '__AC_EVENTS', '__AC_REST', '__AC_SESSIONS', '__AC_WORKSPACES', '__AC_NAVS', '__AC_INVALIDATIONS', '__AC_ERRORS']) {
     delete globalThis[key]
   }
   restCalls.length = 0
+  renderErrors.length = 0
+  reactStub.__resetForHarness()
+  sdkStub.host.state.profile.set('default')
 }
-
-const SUMMARY_KEY_LIVE = 'action-center|summary|default' // queryKey ['action-center','summary','default']
-const DETAILS_KEY_LIVE = key => `action-center|details|${key}|default`
-
-// ── step 1: register + contribution shapes ───────────────────────────────────
 
 const ctx = makeCtx()
 try {
@@ -389,51 +128,43 @@ check('one gateway event subscription (*)', (globalThis.__AC_EVENTS || []).some(
 
 resetGlobals()
 globalThis.__AC_DATA = { [SUMMARY_KEY_LIVE]: SUMMARY_POPULATED }
-renderContribution(chip, 'render:chip[populated]')
-renderContribution(page, 'render:page[populated]')
+renderPass(chip, 'render:chip[populated]', renderErrors, 'chip-pop')
+renderPass(page, 'render:page[populated]', renderErrors, 'page-pop')
 check('populated walk: no render errors', renderErrors.length === 0, renderErrors.map(([p, e]) => `${p}: ${e?.message}`).join(' | '))
 
 // ── step 3: EMPTY data walk ──────────────────────────────────────────────────
 
 resetGlobals()
 globalThis.__AC_DATA = { [SUMMARY_KEY_LIVE]: SUMMARY_EMPTY }
-renderContribution(chip, 'render:chip[empty]')
-renderContribution(page, 'render:page[empty]')
+renderPass(chip, 'render:chip[empty]', renderErrors, 'chip-empty')
+renderPass(page, 'render:page[empty]', renderErrors, 'page-empty')
 check('empty walk: no render errors', renderErrors.length === 0, renderErrors.map(([p, e]) => `${p}: ${e?.message}`).join(' | '))
 
 // ── step 4: ERROR state walk (summary fails) ─────────────────────────────────
 
 resetGlobals()
 globalThis.__AC_ERR = { [SUMMARY_KEY_LIVE]: { detail: 'inbox aggregation unavailable' } }
-renderContribution(chip, 'render:chip[error]')
-renderContribution(page, 'render:page[error]')
+renderPass(chip, 'render:chip[error]', renderErrors, 'chip-err')
+renderPass(page, 'render:page[error]', renderErrors, 'page-err')
 check('error walk: no render errors', renderErrors.length === 0, renderErrors.map(([p, e]) => `${p}: ${e?.message}`).join(' | '))
 
 // ── step 5: PARTIAL coverage walk (error banner) ─────────────────────────────
 
 resetGlobals()
 globalThis.__AC_DATA = { [SUMMARY_KEY_LIVE]: SUMMARY_PARTIAL }
-renderContribution(page, 'render:page[partial]')
+renderPass(page, 'render:page[partial]', renderErrors, 'page-partial')
 check('partial walk: no render errors', renderErrors.length === 0, renderErrors.map(([p, e]) => `${p}: ${e?.message}`).join(' | '))
 
 // ── step 6: expanded-row walk (details populated) ────────────────────────────
 
 resetGlobals()
-globalThis.__componentName = 'ActionCenterPage'
-globalThis.__hookCursor = 0
 globalThis.__AC_DATA = {
   [SUMMARY_KEY_LIVE]: SUMMARY_POPULATED,
   [DETAILS_KEY_LIVE('gallery-goals')]: DETAILS_POPULATED,
   [DETAILS_KEY_LIVE('gallery-background_tasks')]: DETAILS_RESTRICTED
 }
-globalThis.__AC_ROWS = []
-renderContribution(page, 'render:page[collapsed]')
-
-// The react stub persists useState per component scope, so clicking a row
-// (captured by the PanelListRow stub) and re-rendering exercises the expanded
-// detail subtree: meta rows, automation sections, context messages, approval
-// card, clarify cards (single + multi-select + batch), expired card.
-const rowsCollapsed = globalThis.__AC_ROWS || []
+const collapsed = renderPass(page, 'render:page[collapsed]', renderErrors, 'page-step6')
+const rowsCollapsed = collapsed.rows
 const goalsRow = rowsCollapsed.find(r => r.rowKey === 'gallery-goals')
 check('row list renders goals row', Boolean(goalsRow))
 check('row meta line', Boolean(goalsRow && String(goalsRow.meta).includes('Needs you')), goalsRow?.meta)
@@ -442,16 +173,15 @@ check('row list carries every session key', ['gallery-goals', 'gallery-loops', '
   .every(key => rowsCollapsed.some(r => r.rowKey === key)), rowsCollapsed.map(r => r.rowKey).join(','))
 
 if (goalsRow) {
-  goalsRow.onSelect()
-  renderContribution(page, 'render:page[expanded-goals]')
+  await goalsRow.onSelect()
+  renderPass(page, 'render:page[expanded-goals]', renderErrors, 'page-step6')
 }
 check('expanded walk: no render errors', renderErrors.length === 0, renderErrors.map(([p, e]) => `${p}: ${e?.message}`).join(' | '))
 {
   // The expanded detail shows approval + clarify + expired cards and the
-  // context excerpt; assert through a fresh clickable collection.
-  const buttons = []
-  collectClickables(page.render(), buttons)
-  const labels = buttons.map(b => childText(b.props.children)).filter(Boolean)
+  // context excerpt; assert through a fresh pass over the same scenario.
+  const expanded = renderPass(page, 'render:page[expanded-goals]', renderErrors, 'page-step6')
+  const labels = expanded.clickables.map(b => childText(b.props.children)).filter(Boolean)
   check('approval card offers Approve once', labels.includes('Approve once'), labels.join('|'))
   check('approval card offers Approve for session', labels.includes('Approve for session'), labels.join('|'))
   check('approval card offers Always allow', labels.includes('Always allow'), labels.join('|'))
@@ -463,11 +193,62 @@ check('expanded walk: no render errors', renderErrors.length === 0, renderErrors
   check('automation Pause/Resume present', labels.some(l => /^(Pause|Resume) (goal|loop|heartbeat)$/.test(l)), labels.join('|'))
 }
 
+// Batch staging progress surfaces (polish regression): scan page text.
+{
+  const expanded = renderPass(page, 'render:page[expanded-goals]', renderErrors, 'page-step6')
+  check('batch staging progress label', expanded.texts.some(t => /^\d+ of \d+ answered$/.test(t)), expanded.texts.filter(t => t.includes('answered')).join(' | '))
+}
+
+// ── step 6b (NEW regression): responsive posture ─────────────────────────────
+// Parity with the REAL PanelBody (`min-[47.5rem]:flex-row` → 760px viewport at
+// the app's fixed --dt-base-size: 1rem): below 760px the rail stacks full-width
+// above the list; at/above it the rail is an 11rem side column. `narrow`
+// (640px sidebar collapse) is a different breakpoint and must not gate this.
+
+resetGlobals()
+globalThis.__AC_DATA = { [SUMMARY_KEY_LIVE]: SUMMARY_POPULATED }
+{
+  const railEl = () => {
+    // page.render() is the ActionCenterPage element; its body is the invoked
+    // branch. Invoke with the same scope renderPass used so hook slots line up.
+    const root = page.render()
+    const branch = invokeComponent(root.type, root.props, 'render[page-step6b]')
+    const out = []
+    const walk = node => {
+      if (node == null || typeof node !== 'object') return
+      if (Array.isArray(node)) return node.forEach(walk)
+      if (node.__frag) return walk(node.children)
+      if (node.__el) {
+        if (node.key === 'rail') out.push(node)
+        return walk(node.props?.children)
+      }
+    }
+    walk(branch)
+    return out[0] || null
+  }
+  sdkStub.host.state.viewport.set({ width: 1280, height: 800, narrow: false })
+  const wide = renderPass(page, 'render:page[wide]', renderErrors, 'page-step6b')
+  const wideRail = railEl()
+  check('wide viewport renders the section rail', wide.texts.includes('All sessions'), wide.texts.join(' | '))
+  check('wide viewport keeps the 11rem side rail', wideRail?.props?.style?.width === '11rem', JSON.stringify(wideRail?.props?.style))
+  // The previously-broken 640–759px band: PanelBody stacks below 47.5rem even
+  // though the sidebar-collapse `narrow` flag is still false.
+  sdkStub.host.state.viewport.set({ width: 700, height: 700, narrow: false })
+  renderPass(page, 'render:page[700px]', renderErrors, 'page-step6b')
+  const midRail = railEl()
+  check('700px viewport stacks the rail (PanelBody 47.5rem parity)', midRail?.props?.style?.width === '100%', JSON.stringify(midRail?.props?.style))
+  // Well below the breakpoint: stacked rail, list still renders rows.
+  sdkStub.host.state.viewport.set({ width: 500, height: 700, narrow: true })
+  const narrow = renderPass(page, 'render:page[narrow]', renderErrors, 'page-step6b-narrow')
+  const narrowRail = railEl()
+  check('narrow viewport stacks the rail full-width', narrowRail?.props?.style?.width === '100%', JSON.stringify(narrowRail?.props?.style))
+  check('narrow viewport still renders rail + rows', narrow.texts.includes('All sessions') && narrow.rows.some(row => row.rowKey === 'gallery-goals' && row.title === 'Deploy pipeline'), JSON.stringify(narrow.rows.map(row => row.rowKey)))
+  sdkStub.host.state.viewport.set({ width: 1280, height: 800, narrow: false })
+}
+
 // ── step 7: interaction scripting (mutations hit the exact REST routes) ──────
 
 resetGlobals()
-globalThis.__componentName = 'ActionCenterPage'
-globalThis.__hookCursor = 0
 globalThis.__AC_DATA = {
   [SUMMARY_KEY_LIVE]: SUMMARY_POPULATED,
   [DETAILS_KEY_LIVE('gallery-goals')]: DETAILS_POPULATED
@@ -480,22 +261,27 @@ globalThis.__AC_REST = async path => {
   if (path.startsWith('/dismiss')) return { dismissed: true }
   return {}
 }
-renderContribution(page, 'render:page[interact-collapsed]')
-const interactRow = (globalThis.__AC_ROWS || []).find(r => r.rowKey === 'gallery-goals')
-if (interactRow) {
-  interactRow.onSelect()
-  renderContribution(page, 'render:page[interact-expanded]')
+let pass = renderPass(page, 'render:page[interact]', renderErrors, 'page-step7')
+const row7 = pass.rows.find(r => r.rowKey === 'gallery-goals')
+if (row7) {
+  await row7.onSelect()
+  pass = renderPass(page, 'render:page[interact]', renderErrors, 'page-step7')
 }
 
 // Expand a clarify option + stage batch answers, then click submit. The option
 // rows are raw buttons; the batch choices are Button stubs. Drive them through
-// their onClick before asserting the REST calls.
-const clickables = []
-collectClickables(page.render(), clickables)
+// their onClick before asserting the REST calls. Each click is followed by a
+// re-render so staged state shows on the next pick. The trailing task flush
+// mirrors a real UI: a click's awaited post settles (button re-enables) before
+// the next interaction — raw back-to-back onClick calls would interleave
+// closures mid-await, something a disabled-while-busy button makes impossible.
+const flushInflight = () => new Promise(resolve => setTimeout(resolve, 0))
 const clickText = async name => {
-  const btn = clickables.find(b => childText(b.props.children) === name)
+  const btn = clickableByText(pass.clickables, name)
   if (!btn) return false
   await btn.props.onClick()
+  await flushInflight()
+  pass = renderPass(page, 'render:page[interact]', renderErrors, 'page-step7')
   return true
 }
 
@@ -511,7 +297,20 @@ await clickText('Lint')
 await clickText('Typecheck')
 
 const responded = await clickText('Approve once')
-const answered = await clickText('Submit')
+// The expanded row carries TWO single clarify cards (single + multi-select):
+// each Submit click resolves the FIRST unresolved card in DOM order, so click
+// until both have fired their answer POSTs (max 3 passes, stop when both ids
+// are present).
+let answered = false
+for (let i = 0; i < 3; i++) {
+  const again = clickableByText(pass.clickables, 'Submit')
+  if (!again) break
+  await again.props.onClick()
+  pass = renderPass(page, 'render:page[interact]', renderErrors, 'page-step7')
+  const haveSingle = restCalls.some(c => c.path.startsWith('/answer') && c.opts?.body?.request_id === 'req-clarify-1')
+  const haveMulti = restCalls.some(c => c.path.startsWith('/answer') && c.opts?.body?.request_id === 'req-clarify-multi')
+  if (haveSingle && haveMulti) { answered = true; break }
+}
 const batchSubmitted = await clickText('Submit answers')
 const redone = await clickText('Redo')
 const dismissed = await clickText('Dismiss')
@@ -547,30 +346,28 @@ check('control body fields', controlCall
   && controlCall.opts?.body?.live_session_id === 'live-1', JSON.stringify(controlCall?.opts?.body ?? {}))
 check('open full chat routes via host.openSession', openedChat && (globalThis.__AC_SESSIONS || []).some(s => s.id === 'gallery-goals'), JSON.stringify(globalThis.__AC_SESSIONS || []))
 check('mutations invalidate the query cache', (globalThis.__AC_INVALIDATIONS || 0) > 0, String(globalThis.__AC_INVALIDATIONS || 0))
-check('approval restricted choices absent', !clickables.some(b => childText(b.props.children) === 'Approve for session' && String(b.props?.children ?? '').length >= 0) || true) // informational
 check('all POST bodies carry profile', ['respond', 'answer', 'control', 'redo', 'dismiss']
   .every(seg => { const call = restCalls.find(c => c.path.startsWith(`/${seg}`)); return call && call.opts?.body?.profile === 'default' }))
+check('all mutation bodies use POST method', ['respond', 'answer', 'control', 'redo', 'dismiss']
+  .every(seg => { const call = restCalls.find(c => c.path.startsWith(`/${seg}`)); return call && call.opts?.method === 'POST' }))
 
 // ── step 8: restricted approval (allow_session=false, allow_permanent=false) ─
 
 resetGlobals()
-globalThis.__componentName = 'ActionCenterPage'
-globalThis.__hookCursor = 0
 globalThis.__AC_DATA = {
   [SUMMARY_KEY_LIVE]: SUMMARY_POPULATED,
   [DETAILS_KEY_LIVE('gallery-background_tasks')]: DETAILS_RESTRICTED
 }
-renderContribution(page, 'render:page[restricted-collapsed]')
-const restrictedRow = (globalThis.__AC_ROWS || []).find(r => r.rowKey === 'gallery-background_tasks')
+const restrictedCollapsed = renderPass(page, 'render:page[restricted]', renderErrors, 'page-step8')
+const restrictedRow = restrictedCollapsed.rows.find(r => r.rowKey === 'gallery-background_tasks')
 if (restrictedRow) {
-  restrictedRow.onSelect()
-  renderContribution(page, 'render:page[restricted-expanded]')
+  await restrictedRow.onSelect()
+  renderPass(page, 'render:page[restricted]', renderErrors, 'page-step8')
 }
 check('restricted walk: no render errors', renderErrors.length === 0, renderErrors.map(([p, e]) => `${p}: ${e?.message}`).join(' | '))
 {
-  const restrictedButtons = []
-  collectClickables(page.render(), restrictedButtons)
-  const labels = restrictedButtons.map(b => childText(b.props.children))
+  const restricted = renderPass(page, 'render:page[restricted]', renderErrors, 'page-step8')
+  const labels = restricted.clickables.map(b => childText(b.props.children))
   check('restricted approval hides Approve for session', !labels.includes('Approve for session'), labels.join('|'))
   check('restricted approval hides Always allow', !labels.includes('Always allow'), labels.join('|'))
   check('restricted approval still offers Approve once + Deny', labels.includes('Approve once') && labels.includes('Deny'), labels.join('|'))
@@ -582,21 +379,7 @@ resetGlobals()
 globalThis.__AC_DATA = { [SUMMARY_KEY_LIVE]: SUMMARY_POPULATED }
 {
   const tree = chip.render()
-  const texts = []
-  const gather = node => {
-    if (typeof node === 'string' || typeof node === 'number') { texts.push(String(node)); return }
-    if (Array.isArray(node)) { node.forEach(gather); return }
-    if (typeof node === 'object' && node.__frag) gather(node.children)
-    else if (typeof node === 'object' && node.__el) {
-      if (typeof node.type === 'function') {
-        try { gather(invokeComponent(node.type, node.props)) } catch { /* counted elsewhere */ }
-        return
-      }
-      gather(node.props?.children)
-    } else if (typeof node === 'object' && node.$$typeof) return
-    else if (typeof node === 'object' && node.props) gather(node.props.value)
-  }
-  gather(tree)
+  const texts = flattenTexts(tree)
   check('chip label text', texts.includes('Action Center'), texts.join('|'))
   check('chip need-attention count text', texts.includes('1'), texts.join('|'))
 }
@@ -616,6 +399,199 @@ try {
   check('palette refresh invalidates queries', (globalThis.__AC_INVALIDATIONS || 0) > 0, String(globalThis.__AC_INVALIDATIONS || 0))
 } catch (e) {
   check('palette refresh runs', false, String(e))
+}
+
+// ── step 10 (NEW regression): mutation refusal when the profile changes ──────
+// A card pins the profile at mount. The page collapses the expanded row when
+// the profile switches (core parity — queries re-key), but a card closure is
+// still mounted in-flight: capture the card element + hook scope BEFORE the
+// switch, then click the captured closure AFTER the atom swap. The guard must
+// refuse with the named message, never post under the new profile.
+
+resetGlobals()
+globalThis.__AC_DATA = {
+  [SUMMARY_KEY_LIVE]: SUMMARY_POPULATED,
+  [DETAILS_KEY_LIVE('gallery-goals')]: DETAILS_POPULATED
+}
+globalThis.__AC_REST = async () => ({ resolved: 1, status: 'ok' })
+{
+  const passA = renderPass(page, 'render:page[guard]', renderErrors, 'page-step10')
+  const row = passA.rows.find(r => r.rowKey === 'gallery-goals')
+  if (row) {
+    await row.onSelect()
+    renderPass(page, 'render:page[guard]', renderErrors, 'page-step10')
+  }
+  // Capture the mounted card (element + walk scope) BEFORE the switch.
+  const treePre = page.render()
+  const foundPre = []
+  collectByType(treePre, 'ApprovalCard', foundPre, renderErrors, 'render[page-step10]')
+  const cardEl = foundPre[foundPre.length - 1]?.el
+  const cardScope = foundPre[foundPre.length - 1]?.scope
+  check('profile guard scenario mounts an approval card', Boolean(cardEl && cardScope))
+  // Swap the host profile atom (the race window). The page re-render then
+  // collapses the row (correct scope-reset behavior) — the captured closure
+  // stands in for the still-mounted card.
+  sdkStub.host.state.profile.set('other-profile')
+  renderPass(page, 'render:page[guard]', renderErrors, 'page-step10')
+  check('page collapses the expanded row on profile switch', renderPass(page, 'render:page[guard]', renderErrors, 'page-step10').texts.includes('Approve once') === false)
+  // Drive the captured closure: pin must refuse, never post.
+  const branch = cardEl && invokeComponent(cardEl.type, cardEl.props, cardScope)
+  const buttons = branch ? collectBranchClickables(branch) : []
+  const approve = buttons.find(b => childText(b.props?.children) === 'Approve once')
+  if (approve) await approve.props.onClick()
+  const respondCalls = restCalls.filter(c => c.path.startsWith('/respond'))
+  check('profile switch blocks approve (no POST fired under the new profile)', respondCalls.length === 0, JSON.stringify(respondCalls.map(c => c.opts?.body)))
+  // The refusal is visible on the re-invoked card.
+  const again = cardEl && invokeComponent(cardEl.type, cardEl.props, cardScope)
+  const refusalTexts = again ? flattenTexts(again, [], cardScope) : []
+  check('profile switch refusal message shown on the card', refusalTexts.some(t => String(t).includes('Profile changed — re-open to act')), refusalTexts.join(' | '))
+  sdkStub.host.state.profile.set('default')
+}
+
+// ── step 10b (NEW regression): batch answers fail closed mid-loop ─────────────
+// The batch card answers question-by-question across awaited posts. A profile
+// switch landing BETWEEN posts must stop the loop: later questions never land
+// on the new backend under the pinned (stale) profile, the refusal shows, and
+// the card does NOT flip to answered as if everything committed. The switch is
+// injected from inside the REST stub the moment q1's post resolves — the real
+// race window (the host atom flips while the loop is mid-flight).
+
+resetGlobals()
+globalThis.__AC_DATA = {
+  [SUMMARY_KEY_LIVE]: SUMMARY_POPULATED,
+  [DETAILS_KEY_LIVE('gallery-goals')]: DETAILS_POPULATED
+}
+{
+  let q1Answered = false
+  globalThis.__AC_REST = async () => {
+    // The host profile atom flips while the batch loop awaits q2's post: the
+    // first resolution triggers the swap, so q2+ must never fire.
+    if (!q1Answered) {
+      q1Answered = true
+      sdkStub.host.state.profile.set('other-profile')
+    }
+    return { status: 'ok' }
+  }
+  const passB = renderPass(page, 'render:page[guard-batch]', renderErrors, 'page-step10b')
+  const row = passB.rows.find(r => r.rowKey === 'gallery-goals')
+  if (row) {
+    await row.onSelect()
+    renderPass(page, 'render:page[guard-batch]', renderErrors, 'page-step10b')
+  }
+  // Capture the batch card element + scope BEFORE the switch, then stage one
+  // answer per question so the submit closure is live.
+  const foundBatch = []
+  collectByType(page.render(), 'BatchClarifyCard', foundBatch, renderErrors, 'render[page-step10b]')
+  const batchEl = foundBatch[foundBatch.length - 1]?.el
+  const batchScope = foundBatch[foundBatch.length - 1]?.scope
+  check('batch guard scenario mounts the batch card', Boolean(batchEl && batchScope))
+  let branch = batchEl && invokeComponent(batchEl.type, batchEl.props, batchScope)
+  let preClickables = branch ? collectBranchClickables(branch) : []
+  for (const label of ['High', 'Production', 'Lint']) {
+    const chip = preClickables.find(b => childText(b.props?.children).endsWith(label))
+    if (chip) {
+      await chip.props.onClick()
+      renderPass(page, 'render:page[guard-batch]', renderErrors, 'page-step10b')
+      branch = invokeComponent(batchEl.type, batchEl.props, batchScope)
+      preClickables = collectBranchClickables(branch)
+    }
+  }
+  const submitBtn = preClickables.find(b => childText(b.props?.children) === 'Submit answers')
+  check('batch guard scenario stages all three answers', Boolean(submitBtn))
+  if (submitBtn) {
+    await submitBtn.props.onClick()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const submitCalls = restCalls.filter(c => c.path.startsWith('/answer') && c.opts?.body?.question_id)
+    check('batch guard: only q1 posted under the pinned profile', submitCalls.length === 1 && submitCalls[0]?.opts?.body?.profile === 'default' && submitCalls[0]?.opts?.body?.question_id === 'q1', JSON.stringify(submitCalls.map(c => c.opts?.body)))
+    check('batch guard: q2/q3 never posted', !submitCalls.some(c => c.opts?.body?.question_id !== 'q1'), JSON.stringify(submitCalls.map(c => c.opts?.body?.question_id)))
+    // Re-invoke the card: the guard error must show and the card must NOT be
+    // in the answered terminal state.
+    const after = invokeComponent(batchEl.type, batchEl.props, batchScope)
+    const afterTexts = flattenTexts(after, [], batchScope)
+    check('batch guard: refusal message shown on the batch card', afterTexts.some(t => String(t).includes('Profile changed — re-open to act')), afterTexts.join(' | '))
+    check('batch guard: card did not flip to answered', !afterTexts.includes('Answered'), afterTexts.join(' | '))
+  }
+  sdkStub.host.state.profile.set('default')
+}
+
+// ── step 10c (NEW regression): sync submit locks ─────────────────────────────
+// AutomationControls.run and ExpiredRequestCard.act are async: a second click
+// before the awaited post settles must not fire a second /control or
+// /redo//dismiss. Drive the captured closure twice without letting the first
+// post settle; only one POST may fire. The react stub keeps useState slots, so
+// `busy` still reads null on the second immediate invocation — the ref is what
+// actually gates.
+
+resetGlobals()
+globalThis.__AC_DATA = {
+  [SUMMARY_KEY_LIVE]: SUMMARY_POPULATED,
+  [DETAILS_KEY_LIVE('gallery-goals')]: DETAILS_POPULATED
+}
+globalThis.__AC_REST = async () => ({ ok: true, redone: true, dismissed: true })
+{
+  const passC = renderPass(page, 'render:page[locks]', renderErrors, 'page-step10c')
+  const row = passC.rows.find(r => r.rowKey === 'gallery-goals')
+  if (row) {
+    await row.onSelect()
+    renderPass(page, 'render:page[locks]', renderErrors, 'page-step10c')
+  }
+  // Double-click Redo: capture the ExpiredRequestCard and drive the closure
+  // twice with NO await between them — the ref lock must refuse the second.
+  const foundCard = []
+  collectByType(page.render(), 'ExpiredRequestCard', foundCard, renderErrors, 'render[page-step10c]')
+  const expiredEl = foundCard[foundCard.length - 1]?.el
+  const expiredScope = foundCard[foundCard.length - 1]?.scope
+  check('lock scenario mounts the expired-request card', Boolean(expiredEl && expiredScope))
+  if (expiredEl) {
+    const branch = invokeComponent(expiredEl.type, expiredEl.props, expiredScope)
+    const redo = collectBranchClickables(branch).find(b => childText(b.props?.children) === 'Redo')
+    check('lock scenario offers the Redo button', Boolean(redo))
+    if (redo) {
+      const p1 = redo.props.onClick()
+      await redo.props.onClick() // second click while the first is mid-await
+      await p1
+      await new Promise(resolve => setTimeout(resolve, 0))
+      const redoCalls = restCalls.filter(c => c.path.startsWith('/redo'))
+      check('sync lock: double-clicked Redo posts exactly once', redoCalls.length === 1, JSON.stringify(redoCalls.map(c => c.opts?.body)))
+    }
+  }
+  // Double-click Pause goal the same way.
+  const foundCtl = []
+  collectByType(page.render(), 'AutomationControls', foundCtl, renderErrors, 'render[page-step10c]')
+  const ctlEl = foundCtl[foundCtl.length - 1]?.el
+  const ctlScope = foundCtl[foundCtl.length - 1]?.scope
+  check('lock scenario mounts an automation control', Boolean(ctlEl && ctlScope))
+  if (ctlEl) {
+    const branch = invokeComponent(ctlEl.type, ctlEl.props, ctlScope)
+    const pause = collectBranchClickables(branch).find(b => /^(Pause|Resume) /.test(childText(b.props?.children)))
+    check('lock scenario offers a pause/resume button', Boolean(pause))
+    if (pause) {
+      const p1 = pause.props.onClick()
+      await pause.props.onClick()
+      await p1
+      await new Promise(resolve => setTimeout(resolve, 0))
+      const ctlCalls = restCalls.filter(c => c.path.startsWith('/control'))
+      check('sync lock: double-clicked pause/resume posts exactly once', ctlCalls.length === 1, JSON.stringify(ctlCalls.map(c => c.opts?.body)))
+    }
+  }
+}
+
+// ── step 11 (NEW regression): queries are keyed per profile ──────────────────
+// After a switch the chip reads the NEW profile's cache entry, so a stale count
+// from the old backend never survives on screen.
+
+resetGlobals()
+globalThis.__AC_DATA = {
+  'action-center|summary|default': SUMMARY_POPULATED,
+  'action-center|summary|other-profile': { ...SUMMARY_EMPTY, coverage: { ...SUMMARY_EMPTY.coverage, profile: 'other-profile' } }
+}
+{
+  renderPass(chip, 'render:chip[profiles]', renderErrors, 'chip-step11')
+  sdkStub.host.state.profile.set('other-profile')
+  renderPass(chip, 'render:chip[profiles]', renderErrors, 'chip-step11')
+  const texts = flattenTexts(chip.render())
+  check('chip profile switch: count comes from the new profile', !texts.includes('1'), texts.join('|'))
+  sdkStub.host.state.profile.set('default')
 }
 
 // ── REST route coverage: only SPEC routes ever called ────────────────────────
