@@ -2,9 +2,9 @@
 
 ## Verdict
 
-Ready for a local release with the scope documented in README. The earlier review's three open gates have been addressed: standalone observed-expiry capture, container-aware layout, and packaged-app interaction verification. Nothing has been pushed, published, or installed into the daily Hermes home.
+Ready for release with the scope documented in README. The earlier review's three open gates have been addressed: standalone observed-expiry capture, container-aware layout, and packaged-app interaction verification. Published to GitHub as `jerrygooch/hermes-desktop-action-center` (public) on 2026-09-19; nothing was installed into the daily Hermes home.
 
-Branch: `astra/review-polish`. Original baseline: `02be0c4`; previous review: `f8f64d6`.
+Published branch: `main` (from `astra/review-polish`). Original baseline: `02be0c4`; previous review: `f8f64d6`.
 
 ## Changes since the first review
 
@@ -76,4 +76,4 @@ Full-window images confirm readable wrapping at 214px and an intact notice/butto
 
 ## Release artifact
 
-Build with `python scripts/package_release.py`. The archive contains five allowlisted shipping files and `CONTENTS.sha256`; a separate `.zip.sha256` verifies the whole archive. Tests and fixture endpoints are absent. The archive is prepared locally; publication still requires Jerry's approval.
+Build with `python scripts/package_release.py`. The archive contains five allowlisted shipping files and `CONTENTS.sha256`; a separate `.zip.sha256` verifies the whole archive. Tests and fixture endpoints are absent. The repository is published at github.com/jerrygooch/hermes-desktop-action-center; attaching this archive to a GitHub release is a separate step.

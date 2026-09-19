@@ -12,11 +12,15 @@ Answer approvals and questions, inspect recent context, and pause or resume auto
 - Review persisted expired approvals. Dismiss removes a record; Redo asks the running session to try again. Redo does not grant approval or execute a saved shell command directly.
 - Use a compact layout in narrow panes. Below the usable minimum, the panel shows a width notice and an Expand control instead of squeezed session cards.
 
-## Install a local release
+## Install
 
-The repository is not published yet. There is no working public install link in this release.
+**Desktop half, from the app.** Open **Capabilities → Plugins → Install from Git** and point it at `jerrygooch/hermes-desktop-action-center`, or use the one-click link:
 
-Extract the release ZIP. Choose the Hermes home belonging to the desktop/backend you intend to extend, then copy these files:
+`hermes://plugin/install?repo=jerrygooch/hermes-desktop-action-center&enable=1`
+
+The installer places the desktop half. The backend half is always a manual copy, because its Python runs only when the plugin is listed in the home's `plugins.enabled` allow-list.
+
+**Both halves, manual.** Choose the Hermes home belonging to the desktop/backend you intend to extend, then copy these files from a clone of the repository:
 
 ```text
 Archive                                 Destination below HERMES_HOME
@@ -44,7 +48,7 @@ Compatible records already persisted by a supporting gateway remain usable. Stor
 
 ## Compatibility and verification
 
-Version 0.1.0 was tested on Windows with a packaged Hermes Desktop test build and both the unpatched baseline backend and the feature-reference checkout. See `RELEASE.md` in the source repository for exact revisions, commands, results and test boundaries. This is a local release; publishing and installation into a daily home are separate actions.
+Version 0.1.0 was tested on Windows with a packaged Hermes Desktop test build and both the unpatched baseline backend and the feature-reference checkout. See `RELEASE.md` for exact revisions, commands, results and test boundaries. Installing into a daily home remains a separate, deliberate step.
 
 The UI imports only `@hermes/plugin-sdk`, `react`, and `react/jsx-runtime`. Its API calls stay under `/api/plugins/action-center/`. Optional desktop host APIs are feature-detected. Backend internals are imported lazily; missing capabilities produce visible errors or coverage warnings.
 
