@@ -76,6 +76,6 @@ Full-window images confirm readable wrapping at 214px and an intact notice/butto
 
 ## Release artifact
 
-Build with `python scripts/package_release.py`. The archive contains five allowlisted shipping files and `CONTENTS.sha256`; a separate `.zip.sha256` verifies the whole archive. Tests and fixture endpoints are absent. The repository is published at github.com/jerrygooch/hermes-desktop-action-center; attaching this archive to a GitHub release is a separate step.
+Build with `python scripts/package_release.py`. The archive contains five allowlisted shipping files and `CONTENTS.sha256`; a separate `.zip.sha256` verifies the whole archive. Tests and fixture endpoints are absent. The repository is published at github.com/jerrygooch/hermes-desktop-action-center, and this archive ships as the [v0.1.0 release](https://github.com/jerrygooch/hermes-desktop-action-center/releases/tag/v0.1.0) with its SHA-256 sidecar attached.
 
 One byte-level note: the repository stores LF-normalized blobs (`core.autocrlf=true` on this machine), while the live-tested bytes and this ZIP carry CRLF. Only line endings differ — `git diff` between the tested tree and the pushed tree is clean — so hash comparisons against the receipt should use the ZIP, not a fresh clone.
