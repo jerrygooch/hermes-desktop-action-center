@@ -1,0 +1,7 @@
+{
+  "name": "action-center",
+  "label": "Action Center",
+  "description": "One panel for what every agent session needs from you: approvals, clarify questions, goal/loop/heartbeat controls, and expired requests with Redo/Dismiss.",
+  "version": "0.1.0",
+  "api": "plugin_api.py"
+}
